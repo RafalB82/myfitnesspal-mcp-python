@@ -55,7 +55,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mfp_mcp")
 
-mcp = FastMCP("myfitnesspal_mcp")
+# host/port are read early so FastMCP() can bind correctly at import time.
+_HOST = os.environ.get("MFP_HOST", "0.0.0.0")
+_PORT = int(os.environ.get("MFP_PORT", "8000"))
+
+mcp = FastMCP("myfitnesspal_mcp", host=_HOST, port=_PORT)
 
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
@@ -927,10 +931,5 @@ async def refresh_browser_cookies(browser: str = "chrome") -> str:
 
 if __name__ == "__main__":
     transport = os.environ.get("MFP_TRANSPORT", "streamable-http")
-    host = os.environ.get("MFP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MFP_PORT", "8000"))
-    logger.info(f"Starting MCP server — transport={transport}, host={host}, port={port}")
-    mcp.run(
-        transport=transport,
-        uvicorn_config={"host": host, "port": port},
-    )
+    logger.info(f"Starting MCP server — transport={transport}, host={_HOST}, port={_PORT}")
+    mcp.run(transport=transport)
