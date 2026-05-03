@@ -148,7 +148,7 @@ async def _find_and_click(page, selectors: list, timeout: int = 45000) -> str:
     for sel in selectors:
         try:
             await page.wait_for_selector(sel, timeout=timeout, state="visible")
-            await page.click(sel, timeout=timeout)
+            await page.click(sel, timeout=timeout, force=True)
             logger.info(f"Playwright: clicked selector '{sel}'")
             return sel
         except Exception:
@@ -156,6 +156,23 @@ async def _find_and_click(page, selectors: list, timeout: int = 45000) -> str:
     raise RuntimeError(
         f"None of the submit selectors {selectors} found/clickable within {timeout}ms."
     )
+
+
+async def _dismiss_consent_popup(page) -> None:
+    """Remove GDPR/consent popup iframe that intercepts pointer events on the submit button."""
+    try:
+        await page.wait_for_selector(
+            '[id^="sp_message_container"], [id^="sp_message_iframe"]',
+            timeout=5000,
+            state="attached",
+        )
+        await page.evaluate("""
+            document.querySelectorAll('[id^="sp_message_container"]').forEach(el => el.remove());
+            document.querySelectorAll('[id^="sp_message_iframe"]').forEach(el => el.remove());
+        """)
+        logger.info("Playwright: dismissed consent popup")
+    except Exception:
+        pass  # no popup present — continue
 
 
 async def authenticate_with_credentials_async(username: str, password: str) -> Dict[str, str]:
@@ -247,6 +264,9 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
 
             await _find_and_fill(page, EMAIL_SELECTORS, username)
             await _find_and_fill(page, PASSWORD_SELECTORS, password)
+
+            # Dismiss GDPR/consent popup that intercepts clicks on submit button
+            await _dismiss_consent_popup(page)
 
             logger.info("Playwright: submitting login form")
             await _find_and_click(page, SUBMIT_SELECTORS)
