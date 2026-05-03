@@ -127,13 +127,47 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
     return jar
 
 
+async def _find_and_fill(page, selectors: list, value: str, timeout: int = 45000) -> str:
+    """Try each selector in order; fill the first one that appears. Returns matched selector."""
+    for sel in selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=timeout, state="visible")
+            await page.fill(sel, value, timeout=timeout)
+            logger.info(f"Playwright: filled selector '{sel}'")
+            return sel
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"None of the selectors {selectors} found/fillable within {timeout}ms. "
+        "MFP login page structure may have changed again."
+    )
+
+
+async def _find_and_click(page, selectors: list, timeout: int = 45000) -> str:
+    """Try each selector in order; click the first one that appears. Returns matched selector."""
+    for sel in selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=timeout, state="visible")
+            await page.click(sel, timeout=timeout)
+            logger.info(f"Playwright: clicked selector '{sel}'")
+            return sel
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"None of the submit selectors {selectors} found/clickable within {timeout}ms."
+    )
+
+
 async def authenticate_with_credentials_async(username: str, password: str) -> Dict[str, str]:
     """
     Authenticate with MyFitnessPal using Playwright async headless Chromium.
     Must be async — server runs inside an asyncio event loop (uvicorn/FastMCP).
 
-    Timeouts are intentionally generous to accommodate slow ARM hardware (Raspberry Pi)
-    and Cloudflare bot-detection delays on MyFitnessPal.
+    MFP uses Next.js — the login form is rendered client-side after JS hydration.
+    We wait for networkidle (with domcontentloaded fallback) and use a broad set
+    of selectors to handle both legacy and SPA form field names.
+
+    Timeouts are intentionally generous for slow ARM hardware (Raspberry Pi).
     """
     logger.info("Authenticating with credentials via Playwright async headless Chromium")
 
@@ -144,6 +178,34 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             "Playwright is not installed. Rebuild the Docker image:\n"
             "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
         )
+
+    # Selectors tried in priority order — covers legacy Rails form AND Next.js SPA form.
+    EMAIL_SELECTORS = [
+        'input[name="username"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[id="username"]',
+        'input[id="email"]',
+        'input[autocomplete="username"]',
+        'input[autocomplete="email"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="username" i]',
+        'form input[type="text"]:first-of-type',
+    ]
+    PASSWORD_SELECTORS = [
+        'input[name="password"]',
+        'input[type="password"]',
+        'input[id="password"]',
+        'input[autocomplete="current-password"]',
+    ]
+    SUBMIT_SELECTORS = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Log In")',
+        'button:has-text("Sign In")',
+        'button:has-text("Login")',
+        '[data-testid="login-submit"]',
+    ]
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -167,29 +229,42 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
 
         try:
             logger.info("Playwright: navigating to MFP login page")
-            # goto timeout increased to 60s for ARM/slow connections
             await page.goto("https://www.myfitnesspal.com/account/login", timeout=60000)
-            # Use domcontentloaded instead of networkidle — MFP has persistent background
-            # requests that prevent networkidle from firing on slow hardware (RPi/ARM).
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-            await page.fill('input[name="username"]', username)
-            await page.fill('input[name="password"]', password)
+            # Wait for JS hydration — Next.js SPA renders form after JS loads.
+            # Try networkidle first (best), fall back to domcontentloaded + extra wait.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30000)
+                logger.info("Playwright: networkidle reached")
+            except PlaywrightTimeoutError:
+                logger.info("Playwright: networkidle timeout, falling back to domcontentloaded + 3s wait")
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(3000)
+
+            # Log page title for debugging
+            title = await page.title()
+            logger.info(f"Playwright: login page title: '{title}'")
+
+            await _find_and_fill(page, EMAIL_SELECTORS, username)
+            await _find_and_fill(page, PASSWORD_SELECTORS, password)
 
             logger.info("Playwright: submitting login form")
-            await page.click('input[type="submit"], button[type="submit"]')
+            await _find_and_click(page, SUBMIT_SELECTORS)
 
-            # Wait for URL to change away from the login page (up to 15s)
+            # Wait for redirect away from login page (up to 20s)
             try:
                 await page.wait_for_url(
                     lambda url: "myfitnesspal.com/account/login" not in url,
-                    timeout=15000,
+                    timeout=20000,
                 )
             except PlaywrightTimeoutError:
                 pass  # URL may not change if redirect is slow; check below
 
             # Wait for DOM to settle after redirect
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except PlaywrightTimeoutError:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
 
             current_url = page.url
             logger.info(f"Playwright: post-login URL: {current_url}")
@@ -197,7 +272,7 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             if "myfitnesspal.com/account/login" in current_url:
                 error_text = ""
                 try:
-                    error_el = await page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert']")
+                    error_el = await page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert'], [role='alert']")
                     if error_el:
                         error_text = await error_el.inner_text()
                 except Exception:
