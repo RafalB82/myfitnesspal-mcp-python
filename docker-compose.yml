@@ -60,7 +60,7 @@ services:
       - "traefik.http.services.mfp-mcp.loadbalancer.server.port=8000"
 
       # Sieć używana przez Traefik do komunikacji z kontenerem
-      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-hevy_network}"
 
     # ---- Sieci --------------------------------------------------------
     networks:
@@ -78,4 +78,4 @@ volumes:
 networks:
   traefik:
     external: true
-    name: ${TRAEFIK_NETWORK:-traefik}
+    name: ${TRAEFIK_NETWORK:-hevy_network}
