@@ -6,11 +6,12 @@ with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
 Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD (Playwright headless)
+1. Environment variables: MFP_USERNAME and MFP_PASSWORD (Playwright async headless)
 2. Stored session cookies: ~/.mfp_mcp/cookies.json
 3. Browser cookies: Chrome/Firefox (fallback, requires host desktop session)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -28,12 +29,6 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # ---------------------------------------------------------------------------
 # Patch TransportSecurityMiddleware BEFORE importing FastMCP.
-# In MCP 1.27+ the middleware has enable_dns_rebinding_protection=True by
-# default with an empty allowed_hosts list, which causes 421 for every
-# request when running behind a reverse proxy (Traefik/nginx) that forwards
-# the public domain in the Host header.
-# We replace _validate_host and _validate_origin with pass-throughs so the
-# security class stays in place but stops blocking legitimate proxied requests.
 # ---------------------------------------------------------------------------
 try:
     from mcp.server.transport_security import TransportSecurityMiddleware as _TSM
@@ -53,7 +48,6 @@ except Exception as _patch_err:
 
 from mcp.server.fastmcp import FastMCP
 
-# Configure logging to stderr (required for stdio transport)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -61,10 +55,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mfp_mcp")
 
-# Initialize MCP server
 mcp = FastMCP("myfitnesspal_mcp")
 
-# Configuration paths
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
@@ -75,7 +67,6 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
 
 def ensure_config_dir():
-    """Ensure the config directory exists."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -132,29 +123,23 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
     return jar
 
 
-def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
+async def authenticate_with_credentials_async(username: str, password: str) -> Dict[str, str]:
     """
-    Authenticate with MyFitnessPal using Playwright headless Chromium.
-
-    Replaces the previous httpx approach which failed against MFP's
-    Cloudflare + NextAuth stack: httpx got HTTP 200 from a JS challenge page,
-    reported success, then failed session verification immediately.
-
-    Playwright properly executes JavaScript, passes Cloudflare, and captures
-    the real __Secure-next-auth.session-token cookie after login.
+    Authenticate with MyFitnessPal using Playwright async headless Chromium.
+    Must be async — server runs inside an asyncio event loop (uvicorn/FastMCP).
     """
-    logger.info("Authenticating with credentials via Playwright headless Chromium")
+    logger.info("Authenticating with credentials via Playwright async headless Chromium")
 
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+        from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
     except ImportError:
         raise RuntimeError(
             "Playwright is not installed. Rebuild the Docker image:\n"
             "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
         )
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
@@ -164,26 +149,26 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
                 "--single-process",
             ],
         )
-        context = browser.new_context(
+        context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
         )
-        page = context.new_page()
+        page = await context.new_page()
 
         try:
             logger.info("Playwright: navigating to MFP login page")
-            page.goto("https://www.myfitnesspal.com/account/login", timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            await page.goto("https://www.myfitnesspal.com/account/login", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=15000)
 
-            page.fill('input[name="username"]', username)
-            page.fill('input[name="password"]', password)
+            await page.fill('input[name="username"]', username)
+            await page.fill('input[name="password"]', password)
 
             logger.info("Playwright: submitting login form")
-            page.click('input[type="submit"], button[type="submit"]')
-            page.wait_for_load_state("networkidle", timeout=20000)
+            await page.click('input[type="submit"], button[type="submit"]')
+            await page.wait_for_load_state("networkidle", timeout=20000)
 
             current_url = page.url
             logger.info(f"Playwright: post-login URL: {current_url}")
@@ -191,9 +176,9 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
             if "myfitnesspal.com/account/login" in current_url:
                 error_text = ""
                 try:
-                    error_el = page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert']")
+                    error_el = await page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert']")
                     if error_el:
-                        error_text = error_el.inner_text()
+                        error_text = await error_el.inner_text()
                 except Exception:
                     pass
                 raise RuntimeError(
@@ -201,7 +186,7 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
                     f"Verify MFP_USERNAME / MFP_PASSWORD. Page says: '{error_text}'"
                 )
 
-            raw_cookies = context.cookies()
+            raw_cookies = await context.cookies()
             cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
             logger.info(f"Playwright: captured {len(cookie_dict)} cookies")
 
@@ -223,10 +208,11 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
         except Exception as e:
             raise RuntimeError(f"Playwright authentication error: {e}")
         finally:
-            browser.close()
+            await browser.close()
 
 
-def get_mfp_client():
+async def get_mfp_client_async():
+    """Async version of get_mfp_client — uses async Playwright for auth."""
     import myfitnesspal
     last_error = None
     username = os.environ.get("MFP_USERNAME")
@@ -234,7 +220,6 @@ def get_mfp_client():
 
     if username and password:
         logger.info("Attempting authentication with environment credentials")
-        # Re-use stored cookies to avoid launching Playwright on every request
         stored_cookies = load_cookies()
         if stored_cookies:
             logger.info("Found stored session cookies, testing validity...")
@@ -248,7 +233,7 @@ def get_mfp_client():
                 logger.info(f"Stored cookies invalid: {e}, re-authenticating via Playwright...")
 
         try:
-            cookies = authenticate_with_credentials(username, password)
+            cookies = await authenticate_with_credentials_async(username, password)
             save_cookies(cookies)
             cookiejar = dict_to_cookiejar(cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
@@ -283,10 +268,25 @@ def get_mfp_client():
         raise RuntimeError(
             f"All authentication methods failed. Last error: {str(last_error)}\n\n"
             "Solutions:\n"
-            "1. Set MFP_USERNAME and MFP_PASSWORD in docker-compose.yml\n"
+            "1. Set MFP_USERNAME and MFP_PASSWORD in .env\n"
             "2. Rebuild image: docker compose build --no-cache mfp-mcp\n"
             "3. Check ~/.mfp_mcp/cookies.json for a valid stored session"
         )
+
+
+def get_mfp_client():
+    """Sync wrapper — runs async auth in the current event loop."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We are inside an async context (uvicorn/FastMCP) — schedule as coroutine
+            import concurrent.futures
+            future = asyncio.run_coroutine_threadsafe(get_mfp_client_async(), loop)
+            return future.result(timeout=60)
+        else:
+            return loop.run_until_complete(get_mfp_client_async())
+    except RuntimeError:
+        return asyncio.run(get_mfp_client_async())
 
 
 # ============================================================================
@@ -553,7 +553,7 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
 async def mfp_get_diary(params: GetDiaryInput) -> str:
     """Get the food diary for a specific date."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
         data = {
@@ -588,7 +588,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
 async def mfp_search_food(params: SearchFoodInput) -> str:
     """Search the MyFitnessPal food database."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         results = client.get_food_search_results(params.query)[: params.limit]
         data = {"query": params.query, "count": len(results), "results": []}
         for item in results:
@@ -611,7 +611,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
 async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
     """Get detailed nutritional information for a specific food item."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         item = client.get_food_item_details(params.mfp_id)
         data = {
             "mfp_id": params.mfp_id,
@@ -651,7 +651,7 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
 async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
     """Get body measurements over a date range."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         end = parse_date(params.end_date)
         start = parse_date(params.start_date) if params.start_date else end - timedelta(days=30)
         measurements = client.get_measurements(params.measurement, start, end)
@@ -684,7 +684,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
 async def mfp_set_measurement(params: SetMeasurementInput) -> str:
     """Log a new body measurement for today."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         client.set_measurements(params.measurement, params.value)
         return json.dumps({
             "success": True,
@@ -704,7 +704,7 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
 async def mfp_get_exercises(params: GetExercisesInput) -> str:
     """Get logged exercises for a specific date."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
         data = {"date": str(target_date), "exercises": []}
@@ -728,7 +728,7 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
 async def mfp_get_goals(params: GetGoalsInput) -> str:
     """Get the user's daily nutrition goals."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
         return format_response({"date": str(target_date), "goals": day.goals}, params.response_format, "Daily Nutrition Goals")
@@ -745,7 +745,7 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     try:
         if not any([params.calories, params.protein, params.carbohydrates, params.fat]):
             return "Error: Please provide at least one goal to update"
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         kwargs = {}
         if params.calories:
             kwargs["energy"] = params.calories
@@ -777,7 +777,7 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
 async def mfp_get_water(params: GetWaterInput) -> str:
     """Get water intake for a specific date."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
         return json.dumps({
@@ -796,7 +796,7 @@ async def mfp_get_water(params: GetWaterInput) -> str:
 async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     """Add a food item to the food diary."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         meal = params.meal.strip().capitalize()
         if meal.lower() == "snack":
@@ -835,7 +835,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
 async def mfp_set_water(params: SetWaterInput) -> str:
     """Log water intake for a specific date."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         set_water_intake(client=client, target_date=target_date, cups=params.cups)
         return json.dumps({
@@ -856,7 +856,7 @@ async def mfp_set_water(params: SetWaterInput) -> str:
 async def mfp_get_report(params: GetReportInput) -> str:
     """Get a nutrition report over a date range."""
     try:
-        client = get_mfp_client()
+        client = await get_mfp_client_async()
         end = parse_date(params.end_date)
         start = parse_date(params.start_date) if params.start_date else end - timedelta(days=7)
         report = client.get_report(
@@ -939,17 +939,10 @@ def refresh_browser_cookies(browser: str = "chrome") -> str:
 
 
 def main():
-    """Run the MCP server.
-
-    Transport is selected via the MCP_TRANSPORT environment variable:
-      - 'streamable-http'  (default) — HTTP server on MCP_HOST:MCP_PORT
-      - 'sse'              — Server-Sent Events transport (legacy HTTP)
-      - 'stdio'            — stdin/stdout for local desktop clients
-    """
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-    logger.info(f"Starting MCP server — transport={transport}, host={host}, port={port}")
+    logger.info(f"Starting MCP server \u2014 transport={transport}, host={host}, port={port}")
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "sse":
