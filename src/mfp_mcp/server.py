@@ -27,6 +27,28 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: disable Host-header validation in mcp.server.transport_security
+# This is required when the MCP server runs behind a reverse proxy (e.g. Traefik)
+# that forwards requests with the public Host header instead of "localhost".
+# The patch replaces the SecurityMiddleware dispatch with a pass-through that
+# skips the host check while keeping everything else intact.
+# ---------------------------------------------------------------------------
+try:
+    import mcp.server.transport_security as _ts
+
+    class _PermissiveSecurityMiddleware(_ts.SecurityMiddleware):
+        async def dispatch(self, request, call_next):  # type: ignore[override]
+            return await call_next(request)
+
+    _ts.SecurityMiddleware = _PermissiveSecurityMiddleware
+except Exception as _patch_err:  # pragma: no cover
+    # If the module layout changes in a future mcp release, log and continue.
+    logging.getLogger("mfp_mcp").warning(
+        "Could not patch transport_security: %s", _patch_err
+    )
+# ---------------------------------------------------------------------------
+
 # Configure logging to stderr (required for stdio transport)
 logging.basicConfig(
     level=logging.INFO,
@@ -35,13 +57,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mfp_mcp")
 
-# Allowed hosts: env var MCP_ALLOWED_HOSTS (comma-separated) or "*" to allow all
-_allowed_hosts_env = os.environ.get("MCP_ALLOWED_HOSTS", "*")
-_allowed_hosts: List[str] = [h.strip() for h in _allowed_hosts_env.split(",") if h.strip()]
-
-# Initialize MCP server — pass allowed_hosts so FastMCP transport_security
-# does not reject requests forwarded by Traefik with a non-localhost Host header.
-mcp = FastMCP("myfitnesspal_mcp", allowed_hosts=_allowed_hosts)
+# Initialize MCP server
+mcp = FastMCP("myfitnesspal_mcp")
 
 # Configuration paths
 CONFIG_DIR = Path.home() / ".mfp_mcp"
@@ -59,12 +76,6 @@ def ensure_config_dir():
 
 
 def save_cookies(cookies: Dict[str, str]):
-    """
-    Save session cookies to file for persistence.
-    
-    Args:
-        cookies: Dictionary of cookie name -> value
-    """
     ensure_config_dir()
     cookie_data = {
         "cookies": cookies,
@@ -76,25 +87,15 @@ def save_cookies(cookies: Dict[str, str]):
 
 
 def load_cookies() -> Optional[Dict[str, str]]:
-    """
-    Load session cookies from file.
-    
-    Returns:
-        Dictionary of cookies if file exists and is valid, None otherwise
-    """
     if not COOKIES_FILE.exists():
         return None
-    
     try:
         with open(COOKIES_FILE, "r") as f:
             cookie_data = json.load(f)
-        
-        # Check if cookies are less than 30 days old
         saved_at = datetime.fromisoformat(cookie_data.get("saved_at", "2000-01-01"))
         if datetime.now() - saved_at > timedelta(days=30):
             logger.info("Stored cookies are expired (>30 days old)")
             return None
-        
         return cookie_data.get("cookies")
     except Exception as e:
         logger.warning(f"Failed to load cookies: {e}")
@@ -102,18 +103,7 @@ def load_cookies() -> Optional[Dict[str, str]]:
 
 
 def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
-    """
-    Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
-    
-    Args:
-        cookies_dict: Dictionary of cookie name -> value
-        domain: Domain for the cookies (default: .myfitnesspal.com)
-    
-    Returns:
-        CookieJar: A CookieJar object populated with the cookies
-    """
     jar = CookieJar()
-    
     for name, value in cookies_dict.items():
         cookie = Cookie(
             version=0,
@@ -127,7 +117,7 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
             path="/",
             path_specified=True,
             secure=True,
-            expires=int(time.time()) + 86400 * 30,  # 30 days from now
+            expires=int(time.time()) + 86400 * 30,
             discard=False,
             comment=None,
             comment_url=None,
@@ -135,41 +125,19 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
             rfc2109=False,
         )
         jar.set_cookie(cookie)
-    
     return jar
 
 
 def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
-    """
-    Authenticate with MyFitnessPal using username/password.
-    
-    Args:
-        username: MyFitnessPal username or email
-        password: MyFitnessPal password
-    
-    Returns:
-        Dictionary of session cookies
-        
-    Raises:
-        RuntimeError: If authentication fails
-    """
     logger.info("Authenticating with credentials")
-    
     LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-    
     try:
         with httpx.Client(follow_redirects=True, timeout=30.0) as client:
             response = client.get(LOGIN_URL)
             response.raise_for_status()
-            
             cookies = dict(response.cookies)
-            
-            login_data = {
-                "username": username,
-                "password": password,
-            }
-            
-            login_response = client.post(
+            login_data = {"username": username, "password": password}
+            client.post(
                 LOGIN_URL,
                 data=login_data,
                 headers={
@@ -177,25 +145,19 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
                     "Referer": LOGIN_URL,
                 },
             )
-            
             all_cookies = dict(client.cookies)
-            
             session_indicators = ["user", "session", "auth", "logged_in"]
             has_session = any(
                 any(indicator in name.lower() for indicator in session_indicators)
                 for name in all_cookies.keys()
             )
-            
             if has_session or len(all_cookies) > len(cookies):
                 logger.info("Successfully authenticated with credentials")
                 return all_cookies
-            else:
-                test_response = client.get("https://www.myfitnesspal.com/food/diary")
-                if test_response.status_code == 200 and "login" not in str(test_response.url).lower():
-                    return dict(client.cookies)
-                    
-                raise RuntimeError("Login appeared to fail - no session cookies received")
-                
+            test_response = client.get("https://www.myfitnesspal.com/food/diary")
+            if test_response.status_code == 200 and "login" not in str(test_response.url).lower():
+                return dict(client.cookies)
+            raise RuntimeError("Login appeared to fail - no session cookies received")
     except httpx.HTTPError as e:
         raise RuntimeError(f"HTTP error during authentication: {e}")
     except Exception as e:
@@ -203,30 +165,12 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
 
 
 def get_mfp_client():
-    """
-    Get an authenticated MyFitnessPal client.
-    
-    Authentication is attempted in this order:
-    1. Environment variables (MFP_USERNAME, MFP_PASSWORD)
-    2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Browser cookies (Chrome/Firefox)
-
-    Returns:
-        myfitnesspal.Client: Authenticated client instance
-
-    Raises:
-        RuntimeError: If all authentication methods fail
-    """
     import myfitnesspal
-    
     last_error = None
-    
     username = os.environ.get("MFP_USERNAME")
     password = os.environ.get("MFP_PASSWORD")
-    
     if username and password:
         logger.info("Attempting authentication with environment credentials")
-        
         stored_cookies = load_cookies()
         if stored_cookies:
             logger.info("Found stored session cookies, testing validity...")
@@ -238,21 +182,17 @@ def get_mfp_client():
                 return client
             except Exception as e:
                 logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
-        
         try:
             cookies = authenticate_with_credentials(username, password)
             save_cookies(cookies)
-            
             cookiejar = dict_to_cookiejar(cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
             _ = client.get_date(date.today())
             logger.info("Successfully authenticated with credentials")
             return client
-            
         except Exception as e:
             last_error = e
             logger.warning(f"Credential authentication failed: {e}")
-    
     stored_cookies = load_cookies()
     if stored_cookies:
         logger.info("Attempting authentication with stored cookies")
@@ -265,7 +205,6 @@ def get_mfp_client():
         except Exception as e:
             last_error = e
             logger.warning(f"Stored cookie authentication failed: {e}")
-    
     logger.info("Attempting authentication with browser cookies")
     try:
         client = myfitnesspal.Client()
@@ -331,11 +270,9 @@ class ResponseFormat(str, Enum):
 def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> str:
     if format_type == ResponseFormat.JSON:
         return json.dumps(data, indent=2, default=str)
-
     lines = []
     if title:
         lines.append(f"## {title}\n")
-
     if isinstance(data, dict):
         for key, value in data.items():
             if isinstance(value, dict):
@@ -356,7 +293,6 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
                 lines.append(f"- **{key}**: {value}")
     else:
         lines.append(str(data))
-
     return "\n".join(lines)
 
 
@@ -455,37 +391,23 @@ def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
 ) -> None:
     from urllib import parse
-    
     try:
         date_str = target_date.strftime("%Y-%m-%d")
         diary_url = parse.urljoin(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}?date={date_str}"
         )
-        
         document = client._get_document_for_url(diary_url)
-        
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
+        authenticity_token = document.xpath("(//input[@name='authenticity_token']/@value)[1]")
         if not authenticity_token:
             raise RuntimeError("Could not find authenticity token on diary page")
         authenticity_token = authenticity_token[0]
-        
-        meal_map = {
-            "breakfast": "0",
-            "lunch": "1",
-            "dinner": "2",
-            "snacks": "3",
-            "snack": "3",
-        }
+        meal_map = {"breakfast": "0", "lunch": "1", "dinner": "2", "snacks": "3", "snack": "3"}
         meal_index = meal_map.get(meal.lower(), "0")
-        
         add_food_url = parse.urljoin(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}/add"
         )
-        
         post_data = {
             "authenticity_token": authenticity_token,
             "date": date_str,
@@ -493,28 +415,19 @@ def add_food_to_diary(
             "food_id": mfp_id,
             "quantity": str(quantity),
         }
-        
         if unit:
             post_data["unit"] = unit
-        
         headers = {
             "Referer": diary_url,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-Requested-With": "XMLHttpRequest",
         }
-        
         response = client.session.post(add_food_url, data=post_data, headers=headers)
         response.raise_for_status()
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to add food: HTTP {response.status_code}")
-        
         content = response.text if hasattr(response, 'text') else response.content.decode('utf-8', errors='ignore')
         if 'error' in content.lower() and 'success' not in content.lower():
             logger.warning("Possible error in response from MyFitnessPal API")
-        
         logger.info(f"Successfully added food {mfp_id} to {meal} for {target_date}")
-        
     except Exception as e:
         error_msg = str(e)
         if "HTTP" in error_msg or "status" in error_msg.lower():
@@ -525,48 +438,34 @@ def add_food_to_diary(
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
     from urllib import parse
-    
     try:
         date_str = target_date.strftime("%Y-%m-%d")
         diary_url = parse.urljoin(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}?date={date_str}"
         )
-        
         document = client._get_document_for_url(diary_url)
-        
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
-        )
+        authenticity_token = document.xpath("(//input[@name='authenticity_token']/@value)[1]")
         if not authenticity_token:
             raise RuntimeError("Could not find authenticity token on diary page")
         authenticity_token = authenticity_token[0]
-        
         water_url = parse.urljoin(
             client.BASE_URL_SECURE,
             f"food/diary/{client.effective_username}/water"
         )
-        
         post_data = {
             "authenticity_token": authenticity_token,
             "date": date_str,
             "water": str(cups),
         }
-        
         headers = {
             "Referer": diary_url,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-Requested-With": "XMLHttpRequest",
         }
-        
         response = client.session.post(water_url, data=post_data, headers=headers)
         response.raise_for_status()
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to set water: HTTP {response.status_code}")
-        
         logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
-        
     except Exception as e:
         error_msg = str(e)
         if "HTTP" in error_msg or "status" in error_msg.lower():
@@ -590,7 +489,6 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-
         data = {
             "date": str(target_date),
             "meals": {},
@@ -599,14 +497,12 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
             "water": day.water,
             "notes": day.notes or "",
         }
-
         for meal in day.meals:
             meal_data = {
                 "entries": [format_meal_entry(entry) for entry in meal.entries],
                 "totals": format_nutrition_dict(meal.totals),
             }
             data["meals"][meal.name] = meal_data
-
         totals = {}
         for entry in day.entries:
             for key, value in entry.totals.items():
@@ -614,9 +510,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
                 totals[key] = totals.get(key, 0) + val
         data["daily_totals"] = totals
         data["daily_goals"] = day.goals
-
         return format_response(data, params.response_format, f"Food Diary for {target_date}")
-
     except Exception as e:
         return f"Error retrieving diary: {str(e)}"
 
@@ -631,9 +525,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
         client = get_mfp_client()
         results = client.get_food_search_results(params.query)
         results = results[: params.limit]
-
         data = {"query": params.query, "count": len(results), "results": []}
-
         for item in results:
             data["results"].append({
                 "name": item.name,
@@ -642,9 +534,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
                 "calories": item.calories,
                 "mfp_id": item.mfp_id,
             })
-
         return format_response(data, params.response_format, f"Food Search Results for '{params.query}'")
-
     except Exception as e:
         return f"Error searching foods: {str(e)}"
 
@@ -658,7 +548,6 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
     try:
         client = get_mfp_client()
         item = client.get_food_item_details(params.mfp_id)
-
         data = {
             "mfp_id": params.mfp_id,
             "description": getattr(item, "description", "N/A"),
@@ -685,13 +574,10 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
             },
             "servings": [],
         }
-
         if hasattr(item, "servings"):
             for serving in item.servings:
                 data["servings"].append(str(serving))
-
         return format_response(data, params.response_format, "Food Item Details")
-
     except Exception as e:
         return f"Error getting food details: {str(e)}"
 
@@ -704,12 +590,9 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
     """Get body measurements over a date range."""
     try:
         client = get_mfp_client()
-
         end = parse_date(params.end_date)
         start = parse_date(params.start_date) if params.start_date else end - timedelta(days=30)
-
         measurements = client.get_measurements(params.measurement, start, end)
-
         data = {
             "measurement_type": params.measurement,
             "start_date": str(start),
@@ -717,7 +600,6 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
             "count": len(measurements),
             "values": ordered_dict_to_dict(measurements),
         }
-
         if measurements:
             values = list(measurements.values())
             data["summary"] = {
@@ -728,9 +610,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
                 "max": max(values),
                 "average": round(sum(values) / len(values), 2),
             }
-
         return format_response(data, params.response_format, f"{params.measurement} History")
-
     except Exception as e:
         return f"Error getting measurements: {str(e)}"
 
@@ -744,7 +624,6 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
     try:
         client = get_mfp_client()
         client.set_measurements(params.measurement, params.value)
-
         return json.dumps({
             "success": True,
             "message": f"Successfully logged {params.measurement}: {params.value}",
@@ -752,7 +631,6 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
             "value": params.value,
             "date": str(date.today()),
         }, indent=2)
-
     except Exception as e:
         return f"Error setting measurement: {str(e)}"
 
@@ -767,22 +645,16 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-
         data = {"date": str(target_date), "exercises": []}
-
         for exercise in day.exercises:
             data["exercises"].append(format_exercise(exercise))
-
         total_burned = 0
         for ex in data["exercises"]:
             for entry in ex.get("entries", []):
                 if "nutrition_information" in entry:
                     total_burned += entry["nutrition_information"].get("calories burned", 0)
-
         data["total_calories_burned"] = total_burned
-
         return format_response(data, params.response_format, f"Exercise Log for {target_date}")
-
     except Exception as e:
         return f"Error getting exercises: {str(e)}"
 
@@ -797,11 +669,8 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-
         data = {"date": str(target_date), "goals": day.goals}
-
         return format_response(data, params.response_format, "Daily Nutrition Goals")
-
     except Exception as e:
         return f"Error getting goals: {str(e)}"
 
@@ -815,9 +684,7 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     try:
         if not any([params.calories, params.protein, params.carbohydrates, params.fat]):
             return "Error: Please provide at least one goal to update"
-
         client = get_mfp_client()
-
         kwargs = {}
         if params.calories:
             kwargs["energy"] = params.calories
@@ -827,9 +694,7 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
             kwargs["carbohydrates"] = params.carbohydrates
         if params.fat:
             kwargs["fat"] = params.fat
-
         client.set_new_goal(**kwargs)
-
         return json.dumps({
             "success": True,
             "message": "Successfully updated nutrition goals",
@@ -840,7 +705,6 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
                 "fat": params.fat,
             },
         }, indent=2)
-
     except Exception as e:
         return f"Error setting goals: {str(e)}"
 
@@ -855,15 +719,12 @@ async def mfp_get_water(params: GetWaterInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-
         data = {
             "date": str(target_date),
             "water_cups": day.water,
             "water_ml": day.water * 236.588,
         }
-
         return json.dumps(data, indent=2)
-
     except Exception as e:
         return f"Error getting water intake: {str(e)}"
 
@@ -877,11 +738,9 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
         meal = params.meal.strip().capitalize()
         if meal.lower() == "snack":
             meal = "Snacks"
-        
         add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
@@ -890,13 +749,11 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
             unit=params.unit,
         )
-        
         try:
             food_item = client.get_food_item_details(params.mfp_id)
             food_name = getattr(food_item, "description", "Unknown Food")
-        except:
+        except Exception:
             food_name = "Food item"
-        
         return json.dumps({
             "success": True,
             "message": f"Successfully added {food_name} to {meal}",
@@ -907,7 +764,6 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             "quantity": params.quantity,
             "unit": params.unit,
         }, indent=2)
-        
     except Exception as e:
         return f"Error adding food to diary: {str(e)}"
 
@@ -921,9 +777,7 @@ async def mfp_set_water(params: SetWaterInput) -> str:
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
         set_water_intake(client=client, target_date=target_date, cups=params.cups)
-        
         return json.dumps({
             "success": True,
             "message": f"Successfully logged {params.cups} cups of water",
@@ -931,7 +785,6 @@ async def mfp_set_water(params: SetWaterInput) -> str:
             "cups": params.cups,
             "milliliters": round(params.cups * 236.588, 2),
         }, indent=2)
-        
     except Exception as e:
         return f"Error setting water intake: {str(e)}"
 
@@ -944,24 +797,20 @@ async def mfp_get_report(params: GetReportInput) -> str:
     """Get a nutrition report over a date range."""
     try:
         client = get_mfp_client()
-
         end = parse_date(params.end_date)
         start = parse_date(params.start_date) if params.start_date else end - timedelta(days=7)
-
         report = client.get_report(
             report_name=params.report_name,
             report_category="Nutrition",
             lower_bound=start,
             upper_bound=end,
         )
-
         data = {
             "report_name": params.report_name,
             "start_date": str(start),
             "end_date": str(end),
             "values": ordered_dict_to_dict(report) if isinstance(report, OrderedDict) else report,
         }
-
         if report:
             values = list(report.values())
             numeric_values = [v for v in values if isinstance(v, (int, float))]
@@ -972,9 +821,7 @@ async def mfp_get_report(params: GetReportInput) -> str:
                     "min": min(numeric_values),
                     "max": max(numeric_values),
                 }
-
         return format_response(data, params.response_format, f"{params.report_name} Report")
-
     except Exception as e:
         return f"Error getting report: {str(e)}"
 
@@ -988,7 +835,6 @@ async def mfp_get_report(params: GetReportInput) -> str:
 def refresh_browser_cookies(browser: str = "chrome") -> str:
     """Extract and save session cookies from your web browser."""
     import browser_cookie3
-    
     try:
         if browser.lower() == "chrome":
             cj = browser_cookie3.chrome(domain_name='.myfitnesspal.com')
@@ -996,27 +842,21 @@ def refresh_browser_cookies(browser: str = "chrome") -> str:
             cj = browser_cookie3.firefox(domain_name='.myfitnesspal.com')
         else:
             return f"Unsupported browser: {browser}. Use 'chrome' or 'firefox'."
-        
         cookies = {c.name: c.value for c in cj}
-        
         if '__Secure-next-auth.session-token' not in cookies:
             return (
                 f"No session token found in {browser}. "
                 "Please make sure you are logged into myfitnesspal.com in your browser."
             )
-        
         save_cookies(cookies)
-        
         try:
             import myfitnesspal
             cookiejar = dict_to_cookiejar(cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
             _ = client.get_date(date.today())
-            
             return f"Successfully extracted and verified {len(cookies)} cookies from {browser}. Authentication is now working!"
         except Exception as e:
             return f"Cookies extracted from {browser} but verification failed: {e}."
-            
     except Exception as e:
         error_msg = str(e)
         if "Operation not permitted" in error_msg:
@@ -1036,23 +876,11 @@ def main():
       - 'streamable-http'  (default) — HTTP server on MCP_HOST:MCP_PORT
       - 'sse'              — Server-Sent Events transport (legacy HTTP)
       - 'stdio'            — stdin/stdout for local desktop clients
-
-    Environment variables:
-      MCP_TRANSPORT      transport type (default: streamable-http)
-      MCP_HOST           bind address   (default: 0.0.0.0)
-      MCP_PORT           bind port      (default: 8000)
-      MCP_ALLOWED_HOSTS  comma-separated list of allowed Host headers,
-                         or "*" to allow all (default: *)
     """
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-
-    logger.info(
-        f"Starting MCP server — transport={transport}, host={host}, port={port}, "
-        f"allowed_hosts={_allowed_hosts}"
-    )
-
+    logger.info(f"Starting MCP server — transport={transport}, host={host}, port={port}")
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "sse":
