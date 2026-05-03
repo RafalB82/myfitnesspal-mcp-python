@@ -1668,11 +1668,17 @@ def main():
         mcp.run(transport="sse", host=host, port=port)
     else:
         # Default: streamable-http
-        # FastMCP.run() does not accept host/port directly for streamable-http.
-        # Use uvicorn to serve the ASGI app with the desired bind address and port.
+        # proxy_headers=True — trust X-Forwarded-* headers from Traefik
+        # forwarded_allow_ips="*" — accept forwarded headers from any upstream proxy
         import uvicorn
         app = mcp.streamable_http_app()
-        uvicorn.run(app, host=host, port=port)
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
 
 
 if __name__ == "__main__":
