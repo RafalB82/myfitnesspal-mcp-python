@@ -249,27 +249,22 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             await page.goto("https://www.myfitnesspal.com/account/login", timeout=60000)
 
             # Wait for JS hydration — Next.js SPA renders form after JS loads.
-            # Try networkidle first (best), fall back to domcontentloaded + extra wait.
-            try:
-                await page.wait_for_load_state("networkidle", timeout=30000)
-                logger.info("Playwright: networkidle reached")
-            except PlaywrightTimeoutError:
-                logger.info("Playwright: networkidle timeout, falling back to domcontentloaded + 3s wait")
-                await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(3000)
+            # domcontentloaded is used to avoid networkidle never firing due to background
+            # requests that prevent networkidle from firing on slow hardware (RPi/ARM).
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-            # Log page title for debugging
-            title = await page.title()
-            logger.info(f"Playwright: login page title: '{title}'")
-
-            await _find_and_fill(page, EMAIL_SELECTORS, username)
-            await _find_and_fill(page, PASSWORD_SELECTORS, password)
-
-            # Dismiss GDPR/consent popup that intercepts clicks on submit button
-            await _dismiss_consent_popup(page)
+            await page.wait_for_selector(
+                'input[type="email"], input[name="email"], input[name="username"]',
+                timeout=45000
+            )
+            await page.locator(
+                'input[type="email"], input[name="email"], input[name="username"]'
+            ).first.fill(username)
+            await page.wait_for_selector('input[type="password"]', timeout=15000)
+            await page.fill('input[type="password"]', password)
 
             logger.info("Playwright: submitting login form")
-            await _find_and_click(page, SUBMIT_SELECTORS)
+            await page.click('input[type="submit"], button[type="submit"]')
 
             # Wait for redirect away from login page (up to 20s)
             try:
