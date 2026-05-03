@@ -127,6 +127,9 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
     """
     Authenticate with MyFitnessPal using Playwright async headless Chromium.
     Must be async — server runs inside an asyncio event loop (uvicorn/FastMCP).
+
+    Timeouts are intentionally generous to accommodate slow ARM hardware (Raspberry Pi)
+    and Cloudflare bot-detection delays on MyFitnessPal.
     """
     logger.info("Authenticating with credentials via Playwright async headless Chromium")
 
@@ -160,15 +163,29 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
 
         try:
             logger.info("Playwright: navigating to MFP login page")
-            await page.goto("https://www.myfitnesspal.com/account/login", timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            # goto timeout increased to 60s for ARM/slow connections
+            await page.goto("https://www.myfitnesspal.com/account/login", timeout=60000)
+            # Use domcontentloaded instead of networkidle — MFP has persistent background
+            # requests that prevent networkidle from firing on slow hardware (RPi/ARM).
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
             await page.fill('input[name="username"]', username)
             await page.fill('input[name="password"]', password)
 
             logger.info("Playwright: submitting login form")
             await page.click('input[type="submit"], button[type="submit"]')
-            await page.wait_for_load_state("networkidle", timeout=20000)
+
+            # Wait for URL to change away from the login page (up to 15s)
+            try:
+                await page.wait_for_url(
+                    lambda url: "myfitnesspal.com/account/login" not in url,
+                    timeout=15000,
+                )
+            except PlaywrightTimeoutError:
+                pass  # URL may not change if redirect is slow; check below
+
+            # Wait for DOM to settle after redirect
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
             current_url = page.url
             logger.info(f"Playwright: post-login URL: {current_url}")
@@ -430,7 +447,7 @@ class GetReportInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     report_name: str = Field(default="Net Calories", description="Report name")
     start_date: Optional[str] = Field(default=None, description="Start date YYYY-MM-DD", pattern=r"^\d{4}-\d{2}-\d{2}$")
-    end_date: Optional[str] = Field(default=None, description="End date YYYY-MM-DD", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: Optional[str] = Field(default=None, description="End date YYYY-MM-DD", pattern=r"^\d{4}-\d{2}-\\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
 
 
@@ -859,105 +876,59 @@ async def mfp_get_report(params: GetReportInput) -> str:
         client = await get_mfp_client_async()
         end = parse_date(params.end_date)
         start = parse_date(params.start_date) if params.start_date else end - timedelta(days=7)
-        report = client.get_report(
-            report_name=params.report_name,
-            report_category="Nutrition",
-            lower_bound=start,
-            upper_bound=end,
-        )
+        report = client.get_report(params.report_name, start, end)
         data = {
             "report_name": params.report_name,
             "start_date": str(start),
             "end_date": str(end),
-            "values": ordered_dict_to_dict(report) if isinstance(report, OrderedDict) else report,
+            "data": ordered_dict_to_dict(report),
         }
         if report:
-            values = list(report.values())
-            numeric_values = [v for v in values if isinstance(v, (int, float))]
-            if numeric_values:
+            values = [v for v in report.values() if v is not None]
+            if values:
                 data["summary"] = {
-                    "total": sum(numeric_values),
-                    "average": round(sum(numeric_values) / len(numeric_values), 2),
-                    "min": min(numeric_values),
-                    "max": max(numeric_values),
+                    "average": round(sum(values) / len(values), 2),
+                    "min": min(values),
+                    "max": max(values),
+                    "total": round(sum(values), 2),
                 }
         return format_response(data, params.response_format, f"{params.report_name} Report")
     except Exception as e:
         return f"Error getting report: {str(e)}"
 
 
-# ============================================================================
-# Cookie Management Tool
-# ============================================================================
-
-
-@mcp.tool()
-def refresh_browser_cookies(browser: str = "chrome") -> str:
-    """Extract and save session cookies from your web browser.
+@mcp.tool(
+    name="refresh_browser_cookies",
+    annotations={"title": "Refresh Browser Cookies", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def refresh_browser_cookies(browser: str = "chrome") -> str:
+    """
+    Extract and save session cookies from your web browser.
 
     Only works when running outside Docker with a desktop browser session.
     In Docker use MFP_USERNAME + MFP_PASSWORD — Playwright handles login automatically.
     """
-    import browser_cookie3
     try:
-        if browser.lower() == "chrome":
-            cj = browser_cookie3.chrome(domain_name='.myfitnesspal.com')
-        elif browser.lower() == "firefox":
-            cj = browser_cookie3.firefox(domain_name='.myfitnesspal.com')
-        else:
-            return f"Unsupported browser: {browser}. Use 'chrome' or 'firefox'."
-        cookies = {c.name: c.value for c in cj}
-        if '__Secure-next-auth.session-token' not in cookies:
-            return (
-                f"No session token found in {browser}. "
-                "Make sure you are logged into myfitnesspal.com in that browser."
-            )
-        save_cookies(cookies)
-        try:
-            import myfitnesspal
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
-            return f"Successfully extracted and verified {len(cookies)} cookies from {browser}. Authentication working!"
-        except Exception as e:
-            return f"Cookies extracted from {browser} but session verification failed: {e}"
+        import myfitnesspal
+        client = myfitnesspal.Client(cookiejar_path=browser)
+        _ = client.get_date(date.today())
+        logger.info("Successfully authenticated with browser cookies")
+        return json.dumps({
+            "success": True,
+            "message": f"Successfully refreshed cookies from {browser}",
+            "browser": browser,
+        }, indent=2)
     except Exception as e:
-        error_msg = str(e)
-        if "DBUS_SESSION_BUS_ADDRESS" in error_msg or "secretstorage" in error_msg.lower():
-            return (
-                "Browser cookie extraction failed: no D-Bus session (running in Docker). "
-                "Use MFP_USERNAME + MFP_PASSWORD env vars — Playwright will authenticate automatically."
-            )
-        if "Operation not permitted" in error_msg:
-            return f"Permission denied reading {browser} cookies (macOS sandbox)."
-        return f"Error extracting cookies from {browser}: {e}"
-
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
-
-def main():
-    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
-    host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
-    logger.info(f"Starting MCP server \u2014 transport={transport}, host={host}, port={port}")
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-    elif transport == "sse":
-        mcp.run(transport="sse", host=host, port=port)
-    else:
-        import uvicorn
-        app = mcp.streamable_http_app()
-        uvicorn.run(
-            app,
-            host=host,
-            port=port,
-            proxy_headers=True,
-            forwarded_allow_ips="*",
+        return (
+            f"Failed to refresh browser cookies: {str(e)}\n\n"
+            "Note: This tool only works outside Docker with a desktop browser session.\n"
+            "In Docker, set MFP_USERNAME and MFP_PASSWORD environment variables instead."
         )
 
 
 if __name__ == "__main__":
-    main()
+    transport = os.environ.get("MFP_TRANSPORT", "streamable-http")
+    host = os.environ.get("MFP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MFP_PORT", "8000"))
+    logger.info(f"Starting MCP server — transport={transport}, host={host}, port={port}")
+    mcp.run(transport=transport, host=host, port=port)
