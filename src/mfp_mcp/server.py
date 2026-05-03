@@ -28,21 +28,25 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # ---------------------------------------------------------------------------
 # Patch TransportSecurityMiddleware BEFORE importing FastMCP.
-# In MCP 1.27 the middleware validates the Host header and rejects anything
-# that isn't localhost/127.0.0.1 with 421.  Behind Traefik the public domain
-# is forwarded, so we replace `dispatch` with a pass-through on the class.
-# Patching the method on the class affects every future instance, including
-# the one created internally by streamable_http_app().
+# In MCP 1.27+ the middleware has enable_dns_rebinding_protection=True by
+# default with an empty allowed_hosts list, which causes 421 for every
+# request when running behind a reverse proxy (Traefik/nginx) that forwards
+# the public domain in the Host header.
+# We replace _validate_host and _validate_origin with pass-throughs so the
+# security class stays in place but stops blocking legitimate proxied requests.
 # ---------------------------------------------------------------------------
 try:
     from mcp.server.transport_security import TransportSecurityMiddleware as _TSM
 
-    async def _passthrough_dispatch(self, request, call_next):  # type: ignore[override]
-        return await call_next(request)
+    def _always_valid_host(self, host):
+        return True
 
-    _TSM.dispatch = _passthrough_dispatch  # type: ignore[method-assign]
+    def _always_valid_origin(self, origin):
+        return True
+
+    _TSM._validate_host = _always_valid_host    # type: ignore[method-assign]
+    _TSM._validate_origin = _always_valid_origin  # type: ignore[method-assign]
 except Exception as _patch_err:
-    # If MCP changes its layout in a future release, log and continue.
     import logging as _log
     _log.getLogger("mfp_mcp").warning("Could not patch transport_security: %s", _patch_err)
 # ---------------------------------------------------------------------------
