@@ -1,0 +1,43 @@
+# ============================================================================
+# MyFitnessPal MCP Server — docker-compose
+# Usage:
+#   cp .env.example .env          # fill in your credentials
+#   docker compose up -d --build
+# ============================================================================
+
+services:
+  mfp-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mfp-mcp
+    restart: unless-stopped
+
+    # ---- Authentication -----------------------------------------------
+    # Option A: username + password (recommended for headless / Docker)
+    environment:
+      MFP_USERNAME: ${MFP_USERNAME:-}
+      MFP_PASSWORD: ${MFP_PASSWORD:-}
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-streamable-http}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+
+    # ---- Ports --------------------------------------------------------
+    # Expose only on localhost — let Nginx/Caddy handle TLS termination.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    # ---- Cookie persistence -------------------------------------------
+    # Cookies are written to /root/.mfp_mcp inside the container.
+    # Map to a host directory so they survive container restarts.
+    volumes:
+      - mfp_cookies:/root/.mfp_mcp
+
+    # ---- Resource limits for Raspberry Pi ----------------------------
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  mfp_cookies:

@@ -1641,8 +1641,34 @@ def refresh_browser_cookies(browser: str = "chrome") -> str:
 
 
 def main():
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server.
+
+    Transport is selected via the MCP_TRANSPORT environment variable:
+      - 'streamable-http'  (default) — HTTP server on MCP_HOST:MCP_PORT,
+                                        required for Perplexity Remote Connector
+                                        and any other remote MCP client.
+      - 'sse'              — Server-Sent Events transport (legacy HTTP).
+      - 'stdio'            — stdin/stdout, suitable for local desktop clients
+                            such as Claude Desktop or direct CLI usage.
+
+    Environment variables:
+      MCP_TRANSPORT  transport type (default: streamable-http)
+      MCP_HOST       bind address   (default: 0.0.0.0)
+      MCP_PORT       bind port      (default: 8000)
+    """
+    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+
+    logger.info(f"Starting MCP server — transport={transport}, host={host}, port={port}")
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "sse":
+        mcp.run(transport="sse", host=host, port=port)
+    else:
+        # Default: streamable-http — required for Perplexity Remote Connector
+        mcp.run(transport="streamable-http", host=host, port=port)
 
 
 if __name__ == "__main__":

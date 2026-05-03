@@ -1,42 +1,45 @@
-# MyFitnessPal MCP Server
-# 
-# NOTE: This MCP uses browser cookie authentication by default.
-# For Docker deployment, you'll need to mount your browser's cookie database
-# or use an alternative authentication method.
-#
-# Build: docker build -t mfp-mcp .
-# Run: docker run -it --rm -v ~/.config/google-chrome:/root/.config/google-chrome:ro mfp-mcp
+# syntax=docker/dockerfile:1
+# ============================================================================
+# MyFitnessPal MCP Server — Docker image
+# Optimised for Raspberry Pi (linux/arm64) but works on amd64 too.
+# ============================================================================
 
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+LABEL maintainer="RafalB82"
+LABEL description="MyFitnessPal MCP server with Streamable-HTTP transport for Perplexity Remote Connector"
 
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libffi-dev \
+# System deps — keep minimal
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+
 # Copy project files
-COPY pyproject.toml README.md ./
-COPY src/ ./src/
+COPY . /app
 
-# Install the package
-RUN pip install --no-cache-dir -e .
+# Install the package and all dependencies
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir .
 
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash mcp
-USER mcp
+# Cookie storage volume — mount a named volume or host dir here
+# so that cookies persist across container restarts.
+VOLUME ["/root/.mfp_mcp"]
 
-# Expose default port (for HTTP transport if needed)
+# Expose MCP HTTP port
 EXPOSE 8000
 
-# Default command runs the MCP server with stdio transport
-ENTRYPOINT ["python", "-m", "mfp_mcp.server"]
+# Environment defaults (override in docker-compose or -e flags)
+ENV MCP_TRANSPORT=streamable-http \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000 \
+    PYTHONUNBUFFERED=1
+
+# Health-check — verifies the HTTP endpoint is alive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:8000/mcp || exit 1
+
+CMD ["python", "-m", "mfp_mcp.server"]
