@@ -24,37 +24,30 @@ from collections import OrderedDict
 import time
 
 import httpx
-from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # ---------------------------------------------------------------------------
-# Disable DNS-rebinding protection so the server works behind a reverse proxy
-# (e.g. Traefik) that forwards the public Host header instead of "localhost".
-#
-# MCP ≥ 1.2 uses TransportSecuritySettings.enable_dns_rebinding_protection.
-# We patch the module-level default before FastMCP initialises its middleware.
+# Patch TransportSecurityMiddleware BEFORE importing FastMCP.
+# In MCP 1.27 the middleware validates the Host header and rejects anything
+# that isn't localhost/127.0.0.1 with 421.  Behind Traefik the public domain
+# is forwarded, so we replace `dispatch` with a pass-through on the class.
+# Patching the method on the class affects every future instance, including
+# the one created internally by streamable_http_app().
 # ---------------------------------------------------------------------------
 try:
-    from mcp.server.transport_security import (
-        TransportSecuritySettings,
-        TransportSecurityMiddleware,
-    )
+    from mcp.server.transport_security import TransportSecurityMiddleware as _TSM
 
-    class _OpenMiddleware(TransportSecurityMiddleware):
-        """Pass-through middleware: skips host/origin validation entirely."""
+    async def _passthrough_dispatch(self, request, call_next):  # type: ignore[override]
+        return await call_next(request)
 
-        def __init__(self, settings: TransportSecuritySettings | None = None):
-            super().__init__(
-                TransportSecuritySettings(enable_dns_rebinding_protection=False)
-            )
-
-    import mcp.server.transport_security as _ts_module
-    _ts_module.TransportSecurityMiddleware = _OpenMiddleware
-except Exception as _patch_err:  # pragma: no cover
-    logging.getLogger("mfp_mcp").warning(
-        "Could not patch transport_security: %s", _patch_err
-    )
+    _TSM.dispatch = _passthrough_dispatch  # type: ignore[method-assign]
+except Exception as _patch_err:
+    # If MCP changes its layout in a future release, log and continue.
+    import logging as _log
+    _log.getLogger("mfp_mcp").warning("Could not patch transport_security: %s", _patch_err)
 # ---------------------------------------------------------------------------
+
+from mcp.server.fastmcp import FastMCP
 
 # Configure logging to stderr (required for stdio transport)
 logging.basicConfig(
