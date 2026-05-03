@@ -1667,8 +1667,12 @@ def main():
     elif transport == "sse":
         mcp.run(transport="sse", host=host, port=port)
     else:
-        # Default: streamable-http — required for Perplexity Remote Connector
-        mcp.run(transport="streamable-http", host=host, port=port)
+        # Default: streamable-http
+        # FastMCP.run() does not accept host/port directly for streamable-http.
+        # Use uvicorn to serve the ASGI app with the desired bind address and port.
+        import uvicorn
+        app = mcp.streamable_http_app()
+        uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
