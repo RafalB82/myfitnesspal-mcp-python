@@ -43,11 +43,12 @@ services:
     labels:
       - "traefik.enable=true"
 
-      # Router — HTTPS
+      # Router — HTTPS (middleware mfp-host przepisuje Host: → localhost)
       - "traefik.http.routers.mfp-mcp.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.mfp-mcp.entrypoints=websecure"
       - "traefik.http.routers.mfp-mcp.tls=true"
       - "traefik.http.routers.mfp-mcp.tls.certresolver=${CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.mfp-mcp.middlewares=mfp-host"
 
       # Router — HTTP → redirect na HTTPS
       - "traefik.http.routers.mfp-mcp-http.rule=Host(`${DOMAIN}`)"
@@ -55,6 +56,9 @@ services:
       - "traefik.http.routers.mfp-mcp-http.middlewares=redirect-to-https"
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+
+      # Middleware — przepisanie Host header (fix dla MCP TransportSecurityMiddleware)
+      - "traefik.http.middlewares.mfp-host.headers.customrequestheaders.Host=localhost"
 
       # Service — wskazuje na wewnętrzny port kontenera
       - "traefik.http.services.mfp-mcp.loadbalancer.server.port=8000"
