@@ -28,22 +28,29 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # ---------------------------------------------------------------------------
-# Monkey-patch: disable Host-header validation in mcp.server.transport_security
-# This is required when the MCP server runs behind a reverse proxy (e.g. Traefik)
-# that forwards requests with the public Host header instead of "localhost".
-# The patch replaces the SecurityMiddleware dispatch with a pass-through that
-# skips the host check while keeping everything else intact.
+# Disable DNS-rebinding protection so the server works behind a reverse proxy
+# (e.g. Traefik) that forwards the public Host header instead of "localhost".
+#
+# MCP ≥ 1.2 uses TransportSecuritySettings.enable_dns_rebinding_protection.
+# We patch the module-level default before FastMCP initialises its middleware.
 # ---------------------------------------------------------------------------
 try:
-    import mcp.server.transport_security as _ts
+    from mcp.server.transport_security import (
+        TransportSecuritySettings,
+        TransportSecurityMiddleware,
+    )
 
-    class _PermissiveSecurityMiddleware(_ts.SecurityMiddleware):
-        async def dispatch(self, request, call_next):  # type: ignore[override]
-            return await call_next(request)
+    class _OpenMiddleware(TransportSecurityMiddleware):
+        """Pass-through middleware: skips host/origin validation entirely."""
 
-    _ts.SecurityMiddleware = _PermissiveSecurityMiddleware
+        def __init__(self, settings: TransportSecuritySettings | None = None):
+            super().__init__(
+                TransportSecuritySettings(enable_dns_rebinding_protection=False)
+            )
+
+    import mcp.server.transport_security as _ts_module
+    _ts_module.TransportSecurityMiddleware = _OpenMiddleware
 except Exception as _patch_err:  # pragma: no cover
-    # If the module layout changes in a future mcp release, log and continue.
     logging.getLogger("mfp_mcp").warning(
         "Could not patch transport_security: %s", _patch_err
     )
