@@ -296,7 +296,6 @@ def get_mfp_client():
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # We are inside an async context (uvicorn/FastMCP) — schedule as coroutine
             import concurrent.futures
             future = asyncio.run_coroutine_threadsafe(get_mfp_client_async(), loop)
             return future.result(timeout=60)
@@ -447,7 +446,7 @@ class GetReportInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     report_name: str = Field(default="Net Calories", description="Report name")
     start_date: Optional[str] = Field(default=None, description="Start date YYYY-MM-DD", pattern=r"^\d{4}-\d{2}-\d{2}$")
-    end_date: Optional[str] = Field(default=None, description="End date YYYY-MM-DD", pattern=r"^\d{4}-\d{2}-\\d{2}$")
+    end_date: Optional[str] = Field(default=None, description="End date YYYY-MM-DD", pattern=r"^\d{4}-\d{2}-\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
 
 
@@ -931,4 +930,7 @@ if __name__ == "__main__":
     host = os.environ.get("MFP_HOST", "0.0.0.0")
     port = int(os.environ.get("MFP_PORT", "8000"))
     logger.info(f"Starting MCP server — transport={transport}, host={host}, port={port}")
-    mcp.run(transport=transport, host=host, port=port)
+    mcp.run(
+        transport=transport,
+        uvicorn_config={"host": host, "port": port},
+    )
