@@ -6,9 +6,9 @@ with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
 Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD
+1. Environment variables: MFP_USERNAME and MFP_PASSWORD (Playwright headless)
 2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Browser cookies: Chrome/Firefox (fallback)
+3. Browser cookies: Chrome/Firefox (fallback, requires host desktop session)
 """
 
 import json
@@ -133,39 +133,97 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 
 
 def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
-    logger.info("Authenticating with credentials")
-    LOGIN_URL = "https://www.myfitnesspal.com/account/login"
+    """
+    Authenticate with MyFitnessPal using Playwright headless Chromium.
+
+    Replaces the previous httpx approach which failed against MFP's
+    Cloudflare + NextAuth stack: httpx got HTTP 200 from a JS challenge page,
+    reported success, then failed session verification immediately.
+
+    Playwright properly executes JavaScript, passes Cloudflare, and captures
+    the real __Secure-next-auth.session-token cookie after login.
+    """
+    logger.info("Authenticating with credentials via Playwright headless Chromium")
+
     try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
-            response = client.get(LOGIN_URL)
-            response.raise_for_status()
-            cookies = dict(response.cookies)
-            login_data = {"username": username, "password": password}
-            client.post(
-                LOGIN_URL,
-                data=login_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": LOGIN_URL,
-                },
-            )
-            all_cookies = dict(client.cookies)
-            session_indicators = ["user", "session", "auth", "logged_in"]
-            has_session = any(
-                any(indicator in name.lower() for indicator in session_indicators)
-                for name in all_cookies.keys()
-            )
-            if has_session or len(all_cookies) > len(cookies):
-                logger.info("Successfully authenticated with credentials")
-                return all_cookies
-            test_response = client.get("https://www.myfitnesspal.com/food/diary")
-            if test_response.status_code == 200 and "login" not in str(test_response.url).lower():
-                return dict(client.cookies)
-            raise RuntimeError("Login appeared to fail - no session cookies received")
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"HTTP error during authentication: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Authentication failed: {e}")
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    except ImportError:
+        raise RuntimeError(
+            "Playwright is not installed. Rebuild the Docker image:\n"
+            "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
+        )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--single-process",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
+
+        try:
+            logger.info("Playwright: navigating to MFP login page")
+            page.goto("https://www.myfitnesspal.com/account/login", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+
+            page.fill('input[name="username"]', username)
+            page.fill('input[name="password"]', password)
+
+            logger.info("Playwright: submitting login form")
+            page.click('input[type="submit"], button[type="submit"]')
+            page.wait_for_load_state("networkidle", timeout=20000)
+
+            current_url = page.url
+            logger.info(f"Playwright: post-login URL: {current_url}")
+
+            if "myfitnesspal.com/account/login" in current_url:
+                error_text = ""
+                try:
+                    error_el = page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert']")
+                    if error_el:
+                        error_text = error_el.inner_text()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Login failed — still on login page. "
+                    f"Verify MFP_USERNAME / MFP_PASSWORD. Page says: '{error_text}'"
+                )
+
+            raw_cookies = context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
+            logger.info(f"Playwright: captured {len(cookie_dict)} cookies")
+
+            if "__Secure-next-auth.session-token" not in cookie_dict:
+                names = list(cookie_dict.keys())
+                raise RuntimeError(
+                    f"Login navigation succeeded but session token cookie is missing. "
+                    f"Cookies present: {names}. "
+                    "MFP may require email verification or 2FA — check your inbox."
+                )
+
+            logger.info("Playwright: authentication successful")
+            return cookie_dict
+
+        except RuntimeError:
+            raise
+        except PlaywrightTimeoutError as e:
+            raise RuntimeError(f"Timeout during MFP Playwright login: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Playwright authentication error: {e}")
+        finally:
+            browser.close()
 
 
 def get_mfp_client():
@@ -173,8 +231,10 @@ def get_mfp_client():
     last_error = None
     username = os.environ.get("MFP_USERNAME")
     password = os.environ.get("MFP_PASSWORD")
+
     if username and password:
         logger.info("Attempting authentication with environment credentials")
+        # Re-use stored cookies to avoid launching Playwright on every request
         stored_cookies = load_cookies()
         if stored_cookies:
             logger.info("Found stored session cookies, testing validity...")
@@ -185,7 +245,8 @@ def get_mfp_client():
                 logger.info("Stored cookies are valid")
                 return client
             except Exception as e:
-                logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
+                logger.info(f"Stored cookies invalid: {e}, re-authenticating via Playwright...")
+
         try:
             cookies = authenticate_with_credentials(username, password)
             save_cookies(cookies)
@@ -197,6 +258,7 @@ def get_mfp_client():
         except Exception as e:
             last_error = e
             logger.warning(f"Credential authentication failed: {e}")
+
     stored_cookies = load_cookies()
     if stored_cookies:
         logger.info("Attempting authentication with stored cookies")
@@ -209,6 +271,7 @@ def get_mfp_client():
         except Exception as e:
             last_error = e
             logger.warning(f"Stored cookie authentication failed: {e}")
+
     logger.info("Attempting authentication with browser cookies")
     try:
         client = myfitnesspal.Client()
@@ -219,10 +282,10 @@ def get_mfp_client():
         last_error = e
         raise RuntimeError(
             f"All authentication methods failed. Last error: {str(last_error)}\n\n"
-            "Please try one of these solutions:\n"
-            "1. Set MFP_USERNAME and MFP_PASSWORD environment variables in Claude Desktop config\n"
-            "2. Log into myfitnesspal.com in Chrome or Firefox\n"
-            "3. Check ~/.mfp_mcp/cookies.json for stored session"
+            "Solutions:\n"
+            "1. Set MFP_USERNAME and MFP_PASSWORD in docker-compose.yml\n"
+            "2. Rebuild image: docker compose build --no-cache mfp-mcp\n"
+            "3. Check ~/.mfp_mcp/cookies.json for a valid stored session"
         )
 
 
@@ -502,11 +565,10 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
             "notes": day.notes or "",
         }
         for meal in day.meals:
-            meal_data = {
+            data["meals"][meal.name] = {
                 "entries": [format_meal_entry(entry) for entry in meal.entries],
                 "totals": format_nutrition_dict(meal.totals),
             }
-            data["meals"][meal.name] = meal_data
         totals = {}
         for entry in day.entries:
             for key, value in entry.totals.items():
@@ -527,8 +589,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """Search the MyFitnessPal food database."""
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
-        results = results[: params.limit]
+        results = client.get_food_search_results(params.query)[: params.limit]
         data = {"query": params.query, "count": len(results), "results": []}
         for item in results:
             data["results"].append({
@@ -576,11 +637,8 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
                 "calcium": getattr(item, "calcium", None),
                 "iron": getattr(item, "iron", None),
             },
-            "servings": [],
+            "servings": [str(s) for s in getattr(item, "servings", [])],
         }
-        if hasattr(item, "servings"):
-            for serving in item.servings:
-                data["servings"].append(str(serving))
         return format_response(data, params.response_format, "Food Item Details")
     except Exception as e:
         return f"Error getting food details: {str(e)}"
@@ -652,11 +710,11 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
         data = {"date": str(target_date), "exercises": []}
         for exercise in day.exercises:
             data["exercises"].append(format_exercise(exercise))
-        total_burned = 0
-        for ex in data["exercises"]:
-            for entry in ex.get("entries", []):
-                if "nutrition_information" in entry:
-                    total_burned += entry["nutrition_information"].get("calories burned", 0)
+        total_burned = sum(
+            entry.get("nutrition_information", {}).get("calories burned", 0)
+            for ex in data["exercises"]
+            for entry in ex.get("entries", [])
+        )
         data["total_calories_burned"] = total_burned
         return format_response(data, params.response_format, f"Exercise Log for {target_date}")
     except Exception as e:
@@ -673,8 +731,7 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-        data = {"date": str(target_date), "goals": day.goals}
-        return format_response(data, params.response_format, "Daily Nutrition Goals")
+        return format_response({"date": str(target_date), "goals": day.goals}, params.response_format, "Daily Nutrition Goals")
     except Exception as e:
         return f"Error getting goals: {str(e)}"
 
@@ -723,12 +780,11 @@ async def mfp_get_water(params: GetWaterInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         day = client.get_date(target_date)
-        data = {
+        return json.dumps({
             "date": str(target_date),
             "water_cups": day.water,
             "water_ml": day.water * 236.588,
-        }
-        return json.dumps(data, indent=2)
+        }, indent=2)
     except Exception as e:
         return f"Error getting water intake: {str(e)}"
 
@@ -837,7 +893,11 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
 @mcp.tool()
 def refresh_browser_cookies(browser: str = "chrome") -> str:
-    """Extract and save session cookies from your web browser."""
+    """Extract and save session cookies from your web browser.
+
+    Only works when running outside Docker with a desktop browser session.
+    In Docker use MFP_USERNAME + MFP_PASSWORD — Playwright handles login automatically.
+    """
     import browser_cookie3
     try:
         if browser.lower() == "chrome":
@@ -850,7 +910,7 @@ def refresh_browser_cookies(browser: str = "chrome") -> str:
         if '__Secure-next-auth.session-token' not in cookies:
             return (
                 f"No session token found in {browser}. "
-                "Please make sure you are logged into myfitnesspal.com in your browser."
+                "Make sure you are logged into myfitnesspal.com in that browser."
             )
         save_cookies(cookies)
         try:
@@ -858,13 +918,18 @@ def refresh_browser_cookies(browser: str = "chrome") -> str:
             cookiejar = dict_to_cookiejar(cookies)
             client = myfitnesspal.Client(cookiejar=cookiejar)
             _ = client.get_date(date.today())
-            return f"Successfully extracted and verified {len(cookies)} cookies from {browser}. Authentication is now working!"
+            return f"Successfully extracted and verified {len(cookies)} cookies from {browser}. Authentication working!"
         except Exception as e:
-            return f"Cookies extracted from {browser} but verification failed: {e}."
+            return f"Cookies extracted from {browser} but session verification failed: {e}"
     except Exception as e:
         error_msg = str(e)
+        if "DBUS_SESSION_BUS_ADDRESS" in error_msg or "secretstorage" in error_msg.lower():
+            return (
+                "Browser cookie extraction failed: no D-Bus session (running in Docker). "
+                "Use MFP_USERNAME + MFP_PASSWORD env vars — Playwright will authenticate automatically."
+            )
         if "Operation not permitted" in error_msg:
-            return f"Permission denied reading {browser} cookies (macOS security restriction)."
+            return f"Permission denied reading {browser} cookies (macOS sandbox)."
         return f"Error extracting cookies from {browser}: {e}"
 
 

@@ -1,51 +1,64 @@
-# syntax=docker/dockerfile:1
-# ============================================================================
 # MyFitnessPal MCP Server — Docker image
-# Optimised for Raspberry Pi (linux/arm64) but works on amd64 too.
-# ============================================================================
+#
+# Auth uses Playwright headless Chromium.
+# Set MFP_USERNAME and MFP_PASSWORD in docker-compose.yml.
+#
+# Build:  docker compose build --no-cache mfp-mcp
+# Run:    docker compose up -d mfp-mcp
 
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-LABEL maintainer="RafalB82"
-LABEL description="MyFitnessPal MCP server with Streamable-HTTP transport for Perplexity Remote Connector"
-
-# System deps — keep minimal
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 WORKDIR /app
 
-# Copy project files
-COPY . /app
+# System deps for Playwright Chromium (ARM64 + AMD64)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libffi-dev \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libexpat1 \
+    libxcb1 \
+    libxkbcommon0 \
+    libx11-6 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the package and all dependencies
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir .
+# Install Python package
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir -e .
 
-# Cookie storage volume — mount a named volume or host dir here
-# so that cookies persist across container restarts.
-VOLUME ["/root/.mfp_mcp"]
+# Install Playwright + Chromium browser binary
+RUN pip install --no-cache-dir playwright && \
+    playwright install chromium
 
-# Expose MCP HTTP port
+# Non-root user
+RUN useradd --create-home --shell /bin/bash mcp && \
+    mkdir -p /home/mcp/.mfp_mcp && \
+    chown -R mcp:mcp /home/mcp/.mfp_mcp && \
+    chown -R mcp:mcp /opt/playwright 2>/dev/null || true
+USER mcp
+ENV HOME=/home/mcp
+
 EXPOSE 8000
 
-# Environment defaults (override in docker-compose or -e flags)
-ENV MCP_TRANSPORT=streamable-http \
-    MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000 \
-    PYTHONUNBUFFERED=1
-
-# Health-check — MCP streamable-http responds with 400 (Missing session ID)
-# when called without a session — that means the server is alive and healthy.
-# Without the Accept header the server returns 406 which curl -f treats as failure.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -sf \
-        -H "Accept: application/json, text/event-stream" \
-        -o /dev/null \
-        -w "%{http_code}" \
-        http://localhost:8000/mcp | grep -qE "^(200|400)$" || exit 1
-
-CMD ["python", "-m", "mfp_mcp.server"]
+ENTRYPOINT ["python", "-m", "mfp_mcp.server"]
