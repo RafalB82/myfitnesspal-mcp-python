@@ -38,8 +38,14 @@ ENV MCP_TRANSPORT=streamable-http \
     MCP_PORT=8000 \
     PYTHONUNBUFFERED=1
 
-# Health-check — verifies the HTTP endpoint is alive
+# Health-check — MCP streamable-http responds with 400 (Missing session ID)
+# when called without a session — that means the server is alive and healthy.
+# Without the Accept header the server returns 406 which curl -f treats as failure.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -sf http://localhost:8000/mcp || exit 1
+    CMD curl -sf \
+        -H "Accept: application/json, text/event-stream" \
+        -o /dev/null \
+        -w "%{http_code}" \
+        http://localhost:8000/mcp | grep -qE "^(200|400)$" || exit 1
 
 CMD ["python", "-m", "mfp_mcp.server"]
