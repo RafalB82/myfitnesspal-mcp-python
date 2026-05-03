@@ -263,8 +263,14 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             await page.wait_for_selector('input[type="password"]', timeout=15000)
             await page.fill('input[type="password"]', password)
 
+            # Usuń popup GDPR który blokuje przycisk submit
+            await _dismiss_consent_popup(page)
+
             logger.info("Playwright: submitting login form")
-            await page.click('input[type="submit"], button[type="submit"]')
+            await page.click(
+                'input[type="submit"], button[type="submit"]',
+                force=True,
+            )
 
             # Wait for redirect away from login page (up to 20s)
             try:
