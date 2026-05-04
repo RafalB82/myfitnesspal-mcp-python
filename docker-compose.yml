@@ -36,8 +36,14 @@ services:
     #   - "127.0.0.1:8000:8000"
 
     # ---- Cookie persistence -------------------------------------------
+    # Kontener działa jako user "mcp" (uid 1000), home = /home/mcp
+    # Żeby ręcznie wstrzyknąć cookies.json:
+    #   docker run --rm \
+    #     -v myfitnesspal-mcp-python_mfp_cookies:/target \
+    #     -v ~/.mfp_mcp/cookies.json:/src/cookies.json:ro \
+    #     alpine sh -c "cp /src/cookies.json /target/cookies.json"
     volumes:
-      - mfp_cookies:/root/.mfp_mcp
+      - mfp_cookies:/home/mcp/.mfp_mcp
 
     # ---- Traefik labels -----------------------------------------------
     labels:
