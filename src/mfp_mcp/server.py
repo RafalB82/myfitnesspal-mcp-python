@@ -127,7 +127,7 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 
 
 async def _dismiss_consent_popup(page) -> None:
-    """Remove GDPR/consent popup iframe that intercepts pointer events on the submit button."""
+    """Remove GDPR/consent popup iframe that intercepts pointer events."""
     try:
         await page.wait_for_selector(
             '[id^="sp_message_container"], [id^="sp_message_iframe"]',
@@ -146,17 +146,13 @@ async def _dismiss_consent_popup(page) -> None:
 async def authenticate_with_credentials_async(username: str, password: str) -> Dict[str, str]:
     """
     Authenticate with MyFitnessPal using Playwright async headless Chromium.
-    Must be async — server runs inside an asyncio event loop (uvicorn/FastMCP).
 
-    playwright-stealth is applied immediately after page creation to patch all
-    JS fingerprints that headless Chromium exposes (navigator.webdriver, plugins,
-    languages, permissions, chrome runtime object, WebGL vendor strings, etc.).
-    Without stealth, Cloudflare/reCAPTCHA returns "technical difficulties" even
-    when credentials are correct.
+    playwright-stealth v2.0 API uses the Stealth class (not stealth_async).
+    Stealth is applied via context manager on the browser context so all pages
+    in the context inherit stealth patches before any JS executes.
 
     Audit fixes applied:
-    - stealth_async(page) called BEFORE goto() — patches JS context before any
-      page scripts can read fingerprint values.
+    - Stealth() context manager applied to browser context (v2.0 API).
     - _dismiss_consent_popup() called BEFORE filling form fields.
     - --disable-blink-features=AutomationDetector in Chromium args.
     - --single-process REMOVED — crashes ARM/aarch64 Chromium (RPi 4/5).
@@ -171,10 +167,12 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
         )
 
+    # playwright-stealth v2.0: import Stealth class.
+    # v1.x used stealth_async(page) function — that API is gone in v2.0.
     try:
-        from playwright_stealth import stealth_async
+        from playwright_stealth import Stealth
         _stealth_available = True
-        logger.info("playwright-stealth available — applying JS fingerprint patches")
+        logger.info("playwright-stealth v2 available — applying JS fingerprint patches via Stealth()")
     except ImportError:
         _stealth_available = False
         logger.warning(
@@ -190,103 +188,104 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-setuid-sandbox",
-                # --single-process REMOVED — crashes Chromium on ARM (RPi 4/5).
-                # --disable-blink-features masks navigator.webdriver at Blink level.
                 "--disable-blink-features=AutomationDetector",
             ],
         )
-        context = await browser.new_context(
+
+        context_kwargs = dict(
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
         )
-        page = await context.new_page()
 
-        # Apply stealth patches BEFORE goto() so page scripts never see
-        # unpatched fingerprint values during initial JS execution.
         if _stealth_available:
-            await stealth_async(page)
-            logger.info("Playwright: stealth patches applied")
+            # v2.0 API: Stealth() as async context manager wrapping new_context()
+            async with Stealth().use_async(browser.new_context(**context_kwargs)) as context:
+                page = await context.new_page()
+                logger.info("Playwright: stealth patches applied via Stealth() context manager")
+                return await _do_login(page, context, username, password, PlaywrightTimeoutError)
+        else:
+            context = await browser.new_context(**context_kwargs)
+            page = await context.new_page()
+            return await _do_login(page, context, username, password, PlaywrightTimeoutError)
+
+        await browser.close()
+
+
+async def _do_login(page, context, username: str, password: str, PlaywrightTimeoutError) -> Dict[str, str]:
+    """Core login flow — shared between stealth and non-stealth paths."""
+    try:
+        logger.info("Playwright: navigating to MFP login page")
+        await page.goto("https://www.myfitnesspal.com/account/login", timeout=60000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+
+        await _dismiss_consent_popup(page)
+
+        await page.wait_for_selector(
+            'input[type="email"], input[name="email"], input[name="username"]',
+            timeout=45000
+        )
+        await page.locator(
+            'input[type="email"], input[name="email"], input[name="username"]'
+        ).first.fill(username)
+        await page.wait_for_selector('input[type="password"]', timeout=15000)
+        await page.fill('input[type="password"]', password)
+
+        logger.info("Playwright: submitting login form")
+        await page.click('input[type="submit"], button[type="submit"]', force=True)
 
         try:
-            logger.info("Playwright: navigating to MFP login page")
-            await page.goto("https://www.myfitnesspal.com/account/login", timeout=60000)
-
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
-
-            # Dismiss consent popup BEFORE interacting with form fields.
-            await _dismiss_consent_popup(page)
-
-            await page.wait_for_selector(
-                'input[type="email"], input[name="email"], input[name="username"]',
-                timeout=45000
+            await page.wait_for_url(
+                lambda url: "myfitnesspal.com/account/login" not in url,
+                timeout=20000,
             )
-            await page.locator(
-                'input[type="email"], input[name="email"], input[name="username"]'
-            ).first.fill(username)
-            await page.wait_for_selector('input[type="password"]', timeout=15000)
-            await page.fill('input[type="password"]', password)
+        except PlaywrightTimeoutError:
+            pass
 
-            logger.info("Playwright: submitting login form")
-            await page.click(
-                'input[type="submit"], button[type="submit"]',
-                force=True,
-            )
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20000)
+        except PlaywrightTimeoutError:
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
 
+        current_url = page.url
+        logger.info(f"Playwright: post-login URL: {current_url}")
+
+        if "myfitnesspal.com/account/login" in current_url:
+            error_text = ""
             try:
-                await page.wait_for_url(
-                    lambda url: "myfitnesspal.com/account/login" not in url,
-                    timeout=20000,
-                )
-            except PlaywrightTimeoutError:
+                error_el = await page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert'], [role='alert']")
+                if error_el:
+                    error_text = await error_el.inner_text()
+            except Exception:
                 pass
+            raise RuntimeError(
+                f"Login failed — still on login page. "
+                f"Verify MFP_USERNAME / MFP_PASSWORD. Page says: '{error_text}'"
+            )
 
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except PlaywrightTimeoutError:
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        raw_cookies = await context.cookies()
+        cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
+        logger.info(f"Playwright: captured {len(cookie_dict)} cookies")
 
-            current_url = page.url
-            logger.info(f"Playwright: post-login URL: {current_url}")
+        if "__Secure-next-auth.session-token" not in cookie_dict:
+            names = list(cookie_dict.keys())
+            raise RuntimeError(
+                f"Login navigation succeeded but session token cookie is missing. "
+                f"Cookies present: {names}. "
+                "MFP may require email verification or 2FA — check your inbox."
+            )
 
-            if "myfitnesspal.com/account/login" in current_url:
-                error_text = ""
-                try:
-                    error_el = await page.query_selector(".main-title-2, .error, [class*='error'], [class*='alert'], [role='alert']")
-                    if error_el:
-                        error_text = await error_el.inner_text()
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"Login failed — still on login page. "
-                    f"Verify MFP_USERNAME / MFP_PASSWORD. Page says: '{error_text}'"
-                )
+        logger.info("Playwright: authentication successful")
+        return cookie_dict
 
-            raw_cookies = await context.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
-            logger.info(f"Playwright: captured {len(cookie_dict)} cookies")
-
-            if "__Secure-next-auth.session-token" not in cookie_dict:
-                names = list(cookie_dict.keys())
-                raise RuntimeError(
-                    f"Login navigation succeeded but session token cookie is missing. "
-                    f"Cookies present: {names}. "
-                    "MFP may require email verification or 2FA — check your inbox."
-                )
-
-            logger.info("Playwright: authentication successful")
-            return cookie_dict
-
-        except RuntimeError:
-            raise
-        except PlaywrightTimeoutError as e:
-            raise RuntimeError(f"Timeout during MFP Playwright login: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Playwright authentication error: {e}")
-        finally:
-            await browser.close()
+    except RuntimeError:
+        raise
+    except PlaywrightTimeoutError as e:
+        raise RuntimeError(f"Timeout during MFP Playwright login: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Playwright authentication error: {e}")
 
 
 async def get_mfp_client_async():
