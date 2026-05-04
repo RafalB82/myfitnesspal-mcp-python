@@ -147,15 +147,18 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
     """
     Authenticate with MyFitnessPal using Playwright async headless Chromium.
 
-    playwright-stealth v2.0 API uses the Stealth class (not stealth_async).
-    Stealth is applied via context manager on the browser context so all pages
-    in the context inherit stealth patches before any JS executes.
+    playwright-stealth v2.0 API:
+      Stealth().use_async() wraps async_playwright() at the TOP level.
+      All browser/context/page objects created inside the block inherit stealth patches.
 
-    Audit fixes applied:
-    - Stealth() context manager applied to browser context (v2.0 API).
-    - _dismiss_consent_popup() called BEFORE filling form fields.
-    - --disable-blink-features=AutomationDetector in Chromium args.
-    - --single-process REMOVED — crashes ARM/aarch64 Chromium (RPi 4/5).
+      WRONG (previous code):
+        async with Stealth().use_async(browser.new_context(...)) as context:
+
+      CORRECT (v2.0 official API):
+        async with Stealth().use_async(async_playwright()) as p:
+            browser = await p.chromium.launch(...)
+            context = await browser.new_context(...)
+            page = await context.new_page()
     """
     logger.info("Authenticating with credentials via Playwright async headless Chromium")
 
@@ -167,8 +170,7 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
         )
 
-    # playwright-stealth v2.0: import Stealth class.
-    # v1.x used stealth_async(page) function — that API is gone in v2.0.
+    # playwright-stealth v2.0: Stealth().use_async() wraps async_playwright() itself.
     try:
         from playwright_stealth import Stealth
         _stealth_available = True
@@ -180,38 +182,41 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             "Rebuild image: docker compose build --no-cache mfp-mcp"
         )
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationDetector",
-            ],
-        )
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationDetector",
+    ]
+    context_kwargs = dict(
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1280, "height": 800},
+    )
 
-        context_kwargs = dict(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-
-        if _stealth_available:
-            # v2.0 API: Stealth() as async context manager wrapping new_context()
-            async with Stealth().use_async(browser.new_context(**context_kwargs)) as context:
-                page = await context.new_page()
-                logger.info("Playwright: stealth patches applied via Stealth() context manager")
-                return await _do_login(page, context, username, password, PlaywrightTimeoutError)
-        else:
+    if _stealth_available:
+        # v2.0 correct API: Stealth wraps the top-level playwright context manager
+        async with Stealth().use_async(async_playwright()) as p:
+            browser = await p.chromium.launch(headless=True, args=launch_args)
             context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
-            return await _do_login(page, context, username, password, PlaywrightTimeoutError)
-
-        await browser.close()
+            logger.info("Playwright: stealth patches active on all pages in this context")
+            try:
+                return await _do_login(page, context, username, password, PlaywrightTimeoutError)
+            finally:
+                await browser.close()
+    else:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=launch_args)
+            context = await browser.new_context(**context_kwargs)
+            page = await context.new_page()
+            try:
+                return await _do_login(page, context, username, password, PlaywrightTimeoutError)
+            finally:
+                await browser.close()
 
 
 async def _do_login(page, context, username: str, password: str, PlaywrightTimeoutError) -> Dict[str, str]:

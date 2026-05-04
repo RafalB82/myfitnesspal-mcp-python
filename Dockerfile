@@ -42,15 +42,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python package
+# Install Python package + all deps (playwright-stealth included via pyproject.toml)
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
-RUN pip install --no-cache-dir -e .
-
-# Install Playwright + stealth + Chromium browser binary
-# playwright-stealth patches JS fingerprints (navigator.webdriver, plugins, etc.)
-# that headless Chromium exposes and that Cloudflare/reCAPTCHA use for bot detection.
-RUN pip install --no-cache-dir playwright playwright-stealth && \
+RUN pip install --no-cache-dir -e . && \
     playwright install chromium
 
 # Non-root user
