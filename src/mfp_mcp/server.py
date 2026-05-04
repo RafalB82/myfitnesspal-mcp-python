@@ -185,6 +185,14 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
     of selectors to handle both legacy and SPA form field names.
 
     Timeouts are intentionally generous for slow ARM hardware (Raspberry Pi).
+
+    Audit fixes applied:
+    - _dismiss_consent_popup() is called BEFORE filling form fields so the
+      SourcePoint iframe cannot intercept pointer/keyboard events on the inputs.
+    - --disable-blink-features=AutomationDetector added to args so Cloudflare/
+      reCAPTCHA cannot detect navigator.webdriver=true via HeadlessChrome checks.
+    - --single-process removed: causes Chromium crashes on ARM (RPi 4/5) because
+      the flag disables process isolation required by aarch64 Chromium builds.
     """
     logger.info("Authenticating with credentials via Playwright async headless Chromium")
 
@@ -232,7 +240,12 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-setuid-sandbox",
-                "--single-process",
+                # FIX: --single-process REMOVED — causes Chromium crashes on ARM (RPi 4/5).
+                # aarch64 Chromium requires process isolation; single-process disables it.
+                #
+                # FIX: hide automation flag so Cloudflare/reCAPTCHA cannot detect
+                # navigator.webdriver=true via HeadlessChrome fingerprint checks.
+                "--disable-blink-features=AutomationDetector",
             ],
         )
         context = await browser.new_context(
@@ -253,6 +266,11 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             # requests that prevent networkidle from firing on slow hardware (RPi/ARM).
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
+            # FIX: dismiss consent popup BEFORE interacting with form fields.
+            # Previously called after fill() — the SourcePoint iframe overlays the entire
+            # page on first visit and can intercept clicks/fills on the email input.
+            await _dismiss_consent_popup(page)
+
             await page.wait_for_selector(
                 'input[type="email"], input[name="email"], input[name="username"]',
                 timeout=45000
@@ -262,9 +280,6 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             ).first.fill(username)
             await page.wait_for_selector('input[type="password"]', timeout=15000)
             await page.fill('input[type="password"]', password)
-
-            # Usuń popup GDPR który blokuje przycisk submit
-            await _dismiss_consent_popup(page)
 
             logger.info("Playwright: submitting login form")
             await page.click(
