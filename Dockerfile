@@ -1,6 +1,6 @@
 # MyFitnessPal MCP Server — Docker image
 #
-# Auth uses Playwright headless Chromium.
+# Auth uses Playwright headless Chromium + playwright-stealth to bypass bot detection.
 # Set MFP_USERNAME and MFP_PASSWORD in docker-compose.yml.
 #
 # Build:  docker compose build --no-cache mfp-mcp
@@ -47,8 +47,10 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir -e .
 
-# Install Playwright + Chromium browser binary
-RUN pip install --no-cache-dir playwright && \
+# Install Playwright + stealth + Chromium browser binary
+# playwright-stealth patches JS fingerprints (navigator.webdriver, plugins, etc.)
+# that headless Chromium exposes and that Cloudflare/reCAPTCHA use for bot detection.
+RUN pip install --no-cache-dir playwright playwright-stealth && \
     playwright install chromium
 
 # Non-root user

@@ -55,7 +55,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mfp_mcp")
 
-# host/port are read early so FastMCP() can bind correctly at import time.
 _HOST = os.environ.get("MFP_HOST", "0.0.0.0")
 _PORT = int(os.environ.get("MFP_PORT", "8000"))
 
@@ -127,37 +126,6 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
     return jar
 
 
-async def _find_and_fill(page, selectors: list, value: str, timeout: int = 45000) -> str:
-    """Try each selector in order; fill the first one that appears. Returns matched selector."""
-    for sel in selectors:
-        try:
-            await page.wait_for_selector(sel, timeout=timeout, state="visible")
-            await page.fill(sel, value, timeout=timeout)
-            logger.info(f"Playwright: filled selector '{sel}'")
-            return sel
-        except Exception:
-            continue
-    raise RuntimeError(
-        f"None of the selectors {selectors} found/fillable within {timeout}ms. "
-        "MFP login page structure may have changed again."
-    )
-
-
-async def _find_and_click(page, selectors: list, timeout: int = 45000) -> str:
-    """Try each selector in order; click the first one that appears. Returns matched selector."""
-    for sel in selectors:
-        try:
-            await page.wait_for_selector(sel, timeout=timeout, state="visible")
-            await page.click(sel, timeout=timeout, force=True)
-            logger.info(f"Playwright: clicked selector '{sel}'")
-            return sel
-        except Exception:
-            continue
-    raise RuntimeError(
-        f"None of the submit selectors {selectors} found/clickable within {timeout}ms."
-    )
-
-
 async def _dismiss_consent_popup(page) -> None:
     """Remove GDPR/consent popup iframe that intercepts pointer events on the submit button."""
     try:
@@ -172,7 +140,7 @@ async def _dismiss_consent_popup(page) -> None:
         """)
         logger.info("Playwright: dismissed consent popup")
     except Exception:
-        pass  # no popup present — continue
+        pass
 
 
 async def authenticate_with_credentials_async(username: str, password: str) -> Dict[str, str]:
@@ -180,19 +148,18 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
     Authenticate with MyFitnessPal using Playwright async headless Chromium.
     Must be async — server runs inside an asyncio event loop (uvicorn/FastMCP).
 
-    MFP uses Next.js — the login form is rendered client-side after JS hydration.
-    We wait for networkidle (with domcontentloaded fallback) and use a broad set
-    of selectors to handle both legacy and SPA form field names.
-
-    Timeouts are intentionally generous for slow ARM hardware (Raspberry Pi).
+    playwright-stealth is applied immediately after page creation to patch all
+    JS fingerprints that headless Chromium exposes (navigator.webdriver, plugins,
+    languages, permissions, chrome runtime object, WebGL vendor strings, etc.).
+    Without stealth, Cloudflare/reCAPTCHA returns "technical difficulties" even
+    when credentials are correct.
 
     Audit fixes applied:
-    - _dismiss_consent_popup() is called BEFORE filling form fields so the
-      SourcePoint iframe cannot intercept pointer/keyboard events on the inputs.
-    - --disable-blink-features=AutomationDetector added to args so Cloudflare/
-      reCAPTCHA cannot detect navigator.webdriver=true via HeadlessChrome checks.
-    - --single-process removed: causes Chromium crashes on ARM (RPi 4/5) because
-      the flag disables process isolation required by aarch64 Chromium builds.
+    - stealth_async(page) called BEFORE goto() — patches JS context before any
+      page scripts can read fingerprint values.
+    - _dismiss_consent_popup() called BEFORE filling form fields.
+    - --disable-blink-features=AutomationDetector in Chromium args.
+    - --single-process REMOVED — crashes ARM/aarch64 Chromium (RPi 4/5).
     """
     logger.info("Authenticating with credentials via Playwright async headless Chromium")
 
@@ -204,33 +171,16 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
         )
 
-    # Selectors tried in priority order — covers legacy Rails form AND Next.js SPA form.
-    EMAIL_SELECTORS = [
-        'input[name="username"]',
-        'input[name="email"]',
-        'input[type="email"]',
-        'input[id="username"]',
-        'input[id="email"]',
-        'input[autocomplete="username"]',
-        'input[autocomplete="email"]',
-        'input[placeholder*="email" i]',
-        'input[placeholder*="username" i]',
-        'form input[type="text"]:first-of-type',
-    ]
-    PASSWORD_SELECTORS = [
-        'input[name="password"]',
-        'input[type="password"]',
-        'input[id="password"]',
-        'input[autocomplete="current-password"]',
-    ]
-    SUBMIT_SELECTORS = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Log In")',
-        'button:has-text("Sign In")',
-        'button:has-text("Login")',
-        '[data-testid="login-submit"]',
-    ]
+    try:
+        from playwright_stealth import stealth_async
+        _stealth_available = True
+        logger.info("playwright-stealth available — applying JS fingerprint patches")
+    except ImportError:
+        _stealth_available = False
+        logger.warning(
+            "playwright-stealth not installed — headless Chromium may be detected as a bot. "
+            "Rebuild image: docker compose build --no-cache mfp-mcp"
+        )
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -240,11 +190,8 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-setuid-sandbox",
-                # FIX: --single-process REMOVED — causes Chromium crashes on ARM (RPi 4/5).
-                # aarch64 Chromium requires process isolation; single-process disables it.
-                #
-                # FIX: hide automation flag so Cloudflare/reCAPTCHA cannot detect
-                # navigator.webdriver=true via HeadlessChrome fingerprint checks.
+                # --single-process REMOVED — crashes Chromium on ARM (RPi 4/5).
+                # --disable-blink-features masks navigator.webdriver at Blink level.
                 "--disable-blink-features=AutomationDetector",
             ],
         )
@@ -257,18 +204,19 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
         )
         page = await context.new_page()
 
+        # Apply stealth patches BEFORE goto() so page scripts never see
+        # unpatched fingerprint values during initial JS execution.
+        if _stealth_available:
+            await stealth_async(page)
+            logger.info("Playwright: stealth patches applied")
+
         try:
             logger.info("Playwright: navigating to MFP login page")
             await page.goto("https://www.myfitnesspal.com/account/login", timeout=60000)
 
-            # Wait for JS hydration — Next.js SPA renders form after JS loads.
-            # domcontentloaded is used to avoid networkidle never firing due to background
-            # requests that prevent networkidle from firing on slow hardware (RPi/ARM).
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-            # FIX: dismiss consent popup BEFORE interacting with form fields.
-            # Previously called after fill() — the SourcePoint iframe overlays the entire
-            # page on first visit and can intercept clicks/fills on the email input.
+            # Dismiss consent popup BEFORE interacting with form fields.
             await _dismiss_consent_popup(page)
 
             await page.wait_for_selector(
@@ -287,16 +235,14 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
                 force=True,
             )
 
-            # Wait for redirect away from login page (up to 20s)
             try:
                 await page.wait_for_url(
                     lambda url: "myfitnesspal.com/account/login" not in url,
                     timeout=20000,
                 )
             except PlaywrightTimeoutError:
-                pass  # URL may not change if redirect is slow; check below
+                pass
 
-            # Wait for DOM to settle after redirect
             try:
                 await page.wait_for_load_state("networkidle", timeout=20000)
             except PlaywrightTimeoutError:
