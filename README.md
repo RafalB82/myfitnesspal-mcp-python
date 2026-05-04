@@ -23,6 +23,7 @@ Supports three transports:
 | `mfp_get_water` | Read | Get water intake for a date |
 | `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
+| `refresh_browser_cookies` | Utility | Extract and save session cookies from a local desktop browser (outside Docker only) |
 
 ## Authentication
 
@@ -363,6 +364,11 @@ Ensure the venv is active and the package is installed: `pip install -e .`
 - `report_name` (optional): `"Net Calories"`, `"Protein"`, `"Fat"`, `"Carbs"`
 - `start_date` / `end_date` (optional): YYYY-MM-DD
 - `response_format`: `"markdown"` or `"json"`
+
+### refresh_browser_cookies
+- `browser` (optional): `"chrome"` or `"firefox"` (default: `"chrome"`)
+- Works **only outside Docker** with a local desktop browser session.
+- In Docker use manual cookie injection (Method 2) instead.
 
 ---
 
