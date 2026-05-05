@@ -1,10 +1,11 @@
 # MyFitnessPal MCP Server — Docker image
 #
-# Auth uses Playwright headless Chromium + playwright-stealth to bypass bot detection.
-# Set MFP_USERNAME and MFP_PASSWORD in docker-compose.yml.
+# Auth uses Playwright HEADED Chromium via Xvfb virtual display.
+# VNC server (port 5900) allows manual reCAPTCHA interaction on first login.
 #
 # Build:  docker compose build --no-cache mfp-mcp
 # Run:    docker compose up -d mfp-mcp
+# VNC:    connect to <host>:5900 (password: mfpvnc)
 
 FROM python:3.12-slim
 
@@ -12,11 +13,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    DISPLAY=:99
 
 WORKDIR /app
 
-# System deps for Playwright Chromium (ARM64 + AMD64)
+# System deps: Playwright Chromium + Xvfb + x11vnc + window manager
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libffi-dev \
@@ -40,9 +42,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
+    xvfb \
+    x11vnc \
+    openbox \
+    xterm \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python package + all deps (playwright-stealth included via pyproject.toml)
+# Install Python package + all deps
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir -e . && \
@@ -53,9 +59,19 @@ RUN useradd --create-home --shell /bin/bash mcp && \
     mkdir -p /home/mcp/.mfp_mcp && \
     chown -R mcp:mcp /home/mcp/.mfp_mcp && \
     chown -R mcp:mcp /opt/playwright 2>/dev/null || true
+
+# VNC password
+RUN mkdir -p /home/mcp/.vnc && \
+    x11vnc -storepasswd mfpvnc /home/mcp/.vnc/passwd && \
+    chown -R mcp:mcp /home/mcp/.vnc
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 USER mcp
 ENV HOME=/home/mcp
 
-EXPOSE 8000
+# MCP server port + VNC port
+EXPOSE 8000 5900
 
-ENTRYPOINT ["python", "-m", "mfp_mcp.server"]
+ENTRYPOINT ["/entrypoint.sh"]

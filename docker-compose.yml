@@ -9,6 +9,11 @@
 # Usage:
 #   cp .env.example .env    # uzupełnij MFP_USERNAME, MFP_PASSWORD, DOMAIN
 #   docker compose up -d --build
+#
+# Pierwsze logowanie (reCAPTCHA):
+#   Podłącz się VNC klientem do <host>:5900 hasło: mfpvnc
+#   Poczekaj aż Chromium się otworzy i kliknij reCAPTCHA ręcznie.
+#   Cookies zostaną zapisane automatycznie — VNC nie jest potrzebny przy kolejnych uruchomieniach.
 # ============================================================================
 
 services:
@@ -27,21 +32,21 @@ services:
       MCP_HOST: 0.0.0.0
       MCP_PORT: 8000
       PYTHONUNBUFFERED: "1"
+      DISPLAY: ":99"
 
     # ---- Porty ---------------------------------------------------------
-    # NIE wystawiamy portów bezpośrednio na hosta — Traefik łączy się
-    # wewnętrznie przez sieć Docker.
+    # VNC wystawiony tylko na localhost dla bezpieczeństwa
+    # Użyj SSH tunnel: ssh -L 5900:localhost:5900 user@host
+    ports:
+      - "127.0.0.1:5900:5900"
     # Odkomentuj poniższe TYLKO do lokalnych testów bez Traefika:
     # ports:
     #   - "127.0.0.1:8000:8000"
 
+    # ---- Shared memory dla Chromium -----------------------------------
+    shm_size: '256mb'
+
     # ---- Cookie persistence -------------------------------------------
-    # Kontener działa jako user "mcp" (uid 1000), home = /home/mcp
-    # Żeby ręcznie wstrzyknąć cookies.json:
-    #   docker run --rm \
-    #     -v myfitnesspal-mcp-python_mfp_cookies:/target \
-    #     -v ~/.mfp_mcp/cookies.json:/src/cookies.json:ro \
-    #     alpine sh -c "cp /src/cookies.json /target/cookies.json"
     volumes:
       - mfp_cookies:/home/mcp/.mfp_mcp
 
@@ -49,7 +54,7 @@ services:
     labels:
       - "traefik.enable=true"
 
-      # Router — HTTPS (middleware mfp-host przepisuje Host: → localhost)
+      # Router — HTTPS
       - "traefik.http.routers.mfp-mcp.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.mfp-mcp.entrypoints=websecure"
       - "traefik.http.routers.mfp-mcp.tls=true"
@@ -63,24 +68,22 @@ services:
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
 
-      # Middleware — przepisanie Host header (fix dla MCP TransportSecurityMiddleware)
+      # Middleware — przepisanie Host header
       - "traefik.http.middlewares.mfp-host.headers.customrequestheaders.Host=localhost"
 
-      # Service — wskazuje na wewnętrzny port kontenera
+      # Service
       - "traefik.http.services.mfp-mcp.loadbalancer.server.port=8000"
-
-      # Sieć używana przez Traefik do komunikacji z kontenerem
       - "traefik.docker.network=${TRAEFIK_NETWORK:-hevy_network}"
 
     # ---- Sieci --------------------------------------------------------
     networks:
-      - traefik       # sieć Traefika (zewnętrzna)
+      - traefik
 
     # ---- Resource limits dla Raspberry Pi ----------------------------
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
 
 volumes:
   mfp_cookies:
