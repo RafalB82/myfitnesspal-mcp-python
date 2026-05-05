@@ -6,7 +6,7 @@ with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
 Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD (Playwright async headless)
+1. Environment variables: MFP_USERNAME and MFP_PASSWORD (Playwright HEADED via Xvfb)
 2. Stored session cookies: ~/.mfp_mcp/cookies.json
 3. Browser cookies: Chrome/Firefox (fallback, requires host desktop session)
 """
@@ -62,6 +62,10 @@ mcp = FastMCP("myfitnesspal_mcp", host=_HOST, port=_PORT)
 
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
+
+# Detect if Xvfb virtual display is available
+_DISPLAY = os.environ.get("DISPLAY", "")
+_USE_HEADED = bool(_DISPLAY)  # headed when DISPLAY is set (Xvfb running)
 
 
 # ============================================================================
@@ -145,22 +149,16 @@ async def _dismiss_consent_popup(page) -> None:
 
 async def authenticate_with_credentials_async(username: str, password: str) -> Dict[str, str]:
     """
-    Authenticate with MyFitnessPal using Playwright async headless Chromium.
+    Authenticate with MyFitnessPal using Playwright.
 
-    playwright-stealth v2.0 API:
-      Stealth().use_async() wraps async_playwright() at the TOP level.
-      All browser/context/page objects created inside the block inherit stealth patches.
+    When DISPLAY env var is set (Xvfb running inside Docker), launches Chromium
+    in HEADED mode — reCAPTCHA sees a real browser window and can be solved
+    manually via VNC (port 5900, password: mfpvnc).
 
-      WRONG (previous code):
-        async with Stealth().use_async(browser.new_context(...)) as context:
-
-      CORRECT (v2.0 official API):
-        async with Stealth().use_async(async_playwright()) as p:
-            browser = await p.chromium.launch(...)
-            context = await browser.new_context(...)
-            page = await context.new_page()
+    When DISPLAY is not set, falls back to headless mode.
     """
-    logger.info("Authenticating with credentials via Playwright async headless Chromium")
+    mode = "headed via Xvfb" if _USE_HEADED else "headless"
+    logger.info(f"Authenticating with credentials via Playwright Chromium ({mode})")
 
     try:
         from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -170,7 +168,6 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
             "  docker compose build --no-cache mfp-mcp && docker compose up -d mfp-mcp"
         )
 
-    # playwright-stealth v2.0: Stealth().use_async() wraps async_playwright() itself.
     try:
         from playwright_stealth import Stealth
         _stealth_available = True
@@ -178,17 +175,30 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
     except ImportError:
         _stealth_available = False
         logger.warning(
-            "playwright-stealth not installed — headless Chromium may be detected as a bot. "
+            "playwright-stealth not installed — Chromium may be detected as a bot. "
             "Rebuild image: docker compose build --no-cache mfp-mcp"
         )
 
     launch_args = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationDetector",
     ]
+
+    if _USE_HEADED:
+        # Headed mode: Xvfb provides the display, VNC allows manual interaction
+        launch_args += [
+            f"--display={_DISPLAY}",
+        ]
+        logger.info(
+            f"Chromium will open on display {_DISPLAY}. "
+            "If reCAPTCHA appears, solve it via VNC on port 5900 (password: mfpvnc)."
+        )
+    else:
+        # Headless fallback
+        launch_args.append("--disable-gpu")
+
     context_kwargs = dict(
         user_agent=(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -198,9 +208,8 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
     )
 
     if _stealth_available:
-        # v2.0 correct API: Stealth wraps the top-level playwright context manager
         async with Stealth().use_async(async_playwright()) as p:
-            browser = await p.chromium.launch(headless=True, args=launch_args)
+            browser = await p.chromium.launch(headless=not _USE_HEADED, args=launch_args)
             context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
             logger.info("Playwright: stealth patches active on all pages in this context")
@@ -210,7 +219,7 @@ async def authenticate_with_credentials_async(username: str, password: str) -> D
                 await browser.close()
     else:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=launch_args)
+            browser = await p.chromium.launch(headless=not _USE_HEADED, args=launch_args)
             context = await browser.new_context(**context_kwargs)
             page = await context.new_page()
             try:
@@ -241,10 +250,18 @@ async def _do_login(page, context, username: str, password: str, PlaywrightTimeo
         logger.info("Playwright: submitting login form")
         await page.click('input[type="submit"], button[type="submit"]', force=True)
 
+        # In headed mode: wait longer to allow manual reCAPTCHA solving via VNC
+        captcha_timeout = 120000 if _USE_HEADED else 20000
+        if _USE_HEADED:
+            logger.info(
+                "Headed mode: waiting up to 120s for login. "
+                "If reCAPTCHA appears in VNC window, solve it now."
+            )
+
         try:
             await page.wait_for_url(
                 lambda url: "myfitnesspal.com/account/login" not in url,
-                timeout=20000,
+                timeout=captcha_timeout,
             )
         except PlaywrightTimeoutError:
             pass
