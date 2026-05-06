@@ -157,8 +157,8 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
     # Camoufox settings for maximum stealth
     camoufox_args = {
         "headless": not _USE_HEADED,
-        "persist_context": True,
-        "data_dir": str(BROWSER_PROFILE_DIR),
+        "persistent_context": True,
+        "user_data_dir": str(BROWSER_PROFILE_DIR),
         "humanize": True,
     }
 
