@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 \
     libxrandr2 \
     libgbm1 \
-    libpango-1.0-0 \
+    libpango-1-0-0 \
     libcairo2 \
     libasound2 \
     # Firefox specific
@@ -53,6 +53,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openbox \
     xterm \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-create X11 directory for non-root user
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 # Install Python package + all deps
 COPY pyproject.toml README.md ./

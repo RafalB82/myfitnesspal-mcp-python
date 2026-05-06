@@ -2,6 +2,7 @@
 set -e
 
 # 1. Start virtual display
+rm -f /tmp/.X99-lock
 Xvfb :99 -screen 0 1280x800x24 -ac &
 XVFB_PID=$!
 echo "[entrypoint] Xvfb started (PID $XVFB_PID)"

@@ -125,7 +125,7 @@ def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal
 
 
 async def _dismiss_consent_popup(page) -> None:
-    """Remove GDPR/consent popup iframe that intercepts pointer events."""
+    \"\"\"Remove GDPR/consent popup iframe that intercepts pointer events.\"\"\"
     try:
         await page.wait_for_selector(
             '[id^="sp_message_container"], [id^="sp_message_iframe"]',
@@ -142,10 +142,10 @@ async def _dismiss_consent_popup(page) -> None:
 
 
 async def authenticate_with_camoufox_async(username: Optional[str] = None, password: Optional[str] = None) -> Dict[str, str]:
-    """
+    \"\"\"
     Authenticate with MyFitnessPal using Camoufox (hardened Firefox fork).
     Uses Persistent Context to save the session in a volume.
-    """
+    \"\"\"
     logger.info("Authenticating with Camoufox (Persistent Context)")
     ensure_config_dir()
 
@@ -234,7 +234,7 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
             raise
 
 async def get_mfp_client_async():
-    """Async version of get_mfp_client — uses Camoufox for auth."""
+    \"\"\"Async version of get_mfp_client — uses Camoufox for auth.\"\"\"
     import myfitnesspal
     last_error = None
     username = os.environ.get("MFP_USERNAME")
@@ -271,7 +271,7 @@ async def get_mfp_client_async():
 
 
 def get_mfp_client():
-    """Sync wrapper."""
+    \"\"\"Sync wrapper.\"\"\"
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -322,7 +322,7 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
         return json.dumps(data, indent=2, default=str)
     lines = []
     if title:
-        lines.append(f"## {title}\n")
+        lines.append(f"## {title}\\n")
     if isinstance(data, dict):
         for key, value in data.items():
             if isinstance(value, dict):
@@ -343,11 +343,11 @@ def format_response(data: Any, format_type: ResponseFormat, title: str = "") -> 
                 lines.append(f"- **{key}**: {value}")
     else:
         lines.append(str(data))
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 class GetDiaryInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, description="Date in YYYY-MM-DD format.", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(default=None, description="Date in YYYY-MM-DD format.", pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format")
 
 class SearchFoodInput(BaseModel):
@@ -364,8 +364,8 @@ class GetFoodDetailsInput(BaseModel):
 class GetMeasurementsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     measurement: str = Field(default="Weight")
-    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    end_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    start_date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
+    end_date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class SetMeasurementInput(BaseModel):
@@ -375,12 +375,12 @@ class SetMeasurementInput(BaseModel):
 
 class GetExercisesInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class GetGoalsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class SetGoalsInput(BaseModel):
@@ -392,27 +392,27 @@ class SetGoalsInput(BaseModel):
 
 class GetWaterInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
 
 class GetReportInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     report_name: str = Field(default="Net Calories")
-    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    end_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    start_date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
+    end_date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 class AddFoodToDiaryInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     mfp_id: str = Field(...)
     meal: str = Field(default="Breakfast")
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
     quantity: float = Field(default=1.0, gt=0)
     unit: Optional[str] = Field(default=None)
 
 class SetWaterInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     cups: float = Field(..., ge=0, le=50)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
 
 # ============================================================================
 
@@ -451,7 +451,7 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
 
 @mcp.tool(name="mfp_get_diary")
 async def mfp_get_diary(params: GetDiaryInput) -> str:
-    """Get the food diary for a specific date."""
+    \"\"\"Get the food diary for a specific date.\"\"\"
     try:
         client = await get_mfp_client_async()
         target_date = parse_date(params.date)
@@ -470,7 +470,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
 
 @mcp.tool(name="mfp_search_food")
 async def mfp_search_food(params: SearchFoodInput) -> str:
-    """Search the MyFitnessPal food database."""
+    \"\"\"Search the MyFitnessPal food database.\"\"\"
     try:
         client = await get_mfp_client_async()
         results = client.get_food_search_results(params.query)[: params.limit]
@@ -480,7 +480,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
 
 @mcp.tool(name="mfp_get_food_details")
 async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
-    """Get detailed nutritional information for a specific food item."""
+    \"\"\"Get detailed nutritional information for a specific food item.\"\"\"
     try:
         client = await get_mfp_client_async()
         item = client.get_food_item_details(params.mfp_id)
@@ -490,7 +490,7 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
 
 @mcp.tool(name="mfp_get_measurements")
 async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
-    """Get body measurements over a date range."""
+    \"\"\"Get body measurements over a date range.\"\"\"
     try:
         client = await get_mfp_client_async()
         end = parse_date(params.end_date)
@@ -501,7 +501,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
 
 @mcp.tool(name="mfp_set_measurement")
 async def mfp_set_measurement(params: SetMeasurementInput) -> str:
-    """Log a new body measurement for today."""
+    \"\"\"Log a new body measurement for today.\"\"\"
     try:
         client = await get_mfp_client_async()
         client.set_measurements(params.measurement, params.value)
@@ -510,7 +510,7 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
 
 @mcp.tool(name="mfp_add_food_to_diary")
 async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
-    """Add a food item to the food diary."""
+    \"\"\"Add a food item to the food diary.\"\"\"
     try:
         client = await get_mfp_client_async()
         target_date = parse_date(params.date)
@@ -520,7 +520,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
 
 @mcp.tool(name="mfp_set_water")
 async def mfp_set_water(params: SetWaterInput) -> str:
-    """Log water intake for a specific date."""
+    \"\"\"Log water intake for a specific date.\"\"\"
     try:
         client = await get_mfp_client_async()
         target_date = parse_date(params.date)
