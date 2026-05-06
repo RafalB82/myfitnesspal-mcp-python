@@ -1,21 +1,3 @@
-# ============================================================================
-# MyFitnessPal MCP Server — docker-compose (Traefik edition)
-#
-# Wymagania:
-#   - Traefik działa już na tym samym hoście z siecią zewnętrzną "traefik"
-#     (lub zmień TRAEFIK_NETWORK na nazwę swojej sieci Traefik)
-#   - Certresolver skonfigurowany w Traefik (np. "letsencrypt")
-#
-# Usage:
-#   cp .env.example .env    # uzupełnij MFP_USERNAME, MFP_PASSWORD, DOMAIN
-#   docker compose up -d --build
-#
-# Pierwsze logowanie (reCAPTCHA):
-#   Podłącz się VNC klientem do <host>:5900 hasło: mfpvnc
-#   Poczekaj aż Chromium się otworzy i kliknij reCAPTCHA ręcznie.
-#   Cookies zostaną zapisane automatycznie — VNC nie jest potrzebny przy kolejnych uruchomieniach.
-# ============================================================================
-
 services:
   mfp-mcp:
     build:
@@ -23,72 +5,49 @@ services:
       dockerfile: Dockerfile
     container_name: mfp-mcp
     restart: unless-stopped
-
-    # ---- Authentication -----------------------------------------------
     environment:
-      MFP_USERNAME: ${MFP_USERNAME:-}
-      MFP_PASSWORD: ${MFP_PASSWORD:-}
-      MCP_TRANSPORT: ${MCP_TRANSPORT:-streamable-http}
-      MCP_HOST: 0.0.0.0
-      MCP_PORT: 8000
-      PYTHONUNBUFFERED: "1"
-      DISPLAY: ":99"
-
-    # ---- Porty ---------------------------------------------------------
-    # VNC wystawiony tylko na localhost dla bezpieczeństwa
-    # Użyj SSH tunnel: ssh -L 5900:localhost:5900 user@host
-    ports:
-      - "127.0.0.1:5900:5900"
-    # Odkomentuj poniższe TYLKO do lokalnych testów bez Traefika:
-    # ports:
-    #   - "127.0.0.1:8000:8000"
-
-    # ---- Shared memory dla Chromium -----------------------------------
-    shm_size: '256mb'
-
-    # ---- Cookie persistence -------------------------------------------
+      # MyFitnessPal credentials (optional if using persistent session via VNC)
+      - MFP_USERNAME=${MFP_USERNAME}
+      - MFP_PASSWORD=${MFP_PASSWORD}
+      
+      # MCP Settings
+      - MFP_HOST=0.0.0.0
+      - MFP_PORT=8000
+      - MFP_TRANSPORT=${MCP_TRANSPORT:-streamable-http}
+      
+      # VNC Display
+      - DISPLAY=:99
     volumes:
+      # Persistent cookies (legacy)
       - mfp_cookies:/home/mcp/.mfp_mcp
-
-    # ---- Traefik labels -----------------------------------------------
+      # NEW: Persistent Browser Profile (Camoufox/Firefox session)
+      - mfp_browser_profile:/home/mcp/.mfp_mcp/browser_profile
     labels:
       - "traefik.enable=true"
-
-      # Router — HTTPS
       - "traefik.http.routers.mfp-mcp.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.mfp-mcp.entrypoints=websecure"
-      - "traefik.http.routers.mfp-mcp.tls=true"
       - "traefik.http.routers.mfp-mcp.tls.certresolver=${CERT_RESOLVER:-letsencrypt}"
-      - "traefik.http.routers.mfp-mcp.middlewares=mfp-host"
-
-      # Router — HTTP → redirect na HTTPS
-      - "traefik.http.routers.mfp-mcp-http.rule=Host(`${DOMAIN}`)"
-      - "traefik.http.routers.mfp-mcp-http.entrypoints=web"
-      - "traefik.http.routers.mfp-mcp-http.middlewares=redirect-to-https"
-      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
-
-      # Middleware — przepisanie Host header
-      - "traefik.http.middlewares.mfp-host.headers.customrequestheaders.Host=localhost"
-
-      # Service
       - "traefik.http.services.mfp-mcp.loadbalancer.server.port=8000"
-      - "traefik.docker.network=${TRAEFIK_NETWORK:-hevy_network}"
-
-    # ---- Sieci --------------------------------------------------------
     networks:
-      - traefik
-
-    # ---- Resource limits dla Raspberry Pi ----------------------------
+      - mfp_network
+      - ${TRAEFIK_NETWORK:-traefik}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/mcp"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+    # Cap resources to prevent memory leaks in Playwright/Firefox
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 2G
 
 volumes:
   mfp_cookies:
+  mfp_browser_profile:
 
 networks:
+  mfp_network:
   traefik:
     external: true
-    name: ${TRAEFIK_NETWORK:-hevy_network}
+    name: ${TRAEFIK_NETWORK:-traefik}
