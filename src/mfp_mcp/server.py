@@ -58,6 +58,11 @@ _PORT = int(os.environ.get("MFP_PORT", "8000"))
 
 mcp = FastMCP("myfitnesspal_mcp", host=_HOST, port=_PORT)
 
+# Add a simple health check endpoint for Docker/Traefik
+@mcp.app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 BROWSER_PROFILE_DIR = CONFIG_DIR / "browser_profile"
