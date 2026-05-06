@@ -17,6 +17,9 @@ services:
       
       # VNC Display
       - DISPLAY=:99
+    ports:
+      - "8000:8000"
+      - "5900:5900"
     volumes:
       # Persistent cookies (legacy)
       - mfp_cookies:/home/mcp/.mfp_mcp
