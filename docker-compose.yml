@@ -35,7 +35,7 @@ services:
       - mfp_network
       - traefik
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/mcp"]
+      test: ["CMD", "curl", "-f", "-H", "Accept: application/json, text/event-stream", "http://localhost:8000/mcp"]
       interval: 1m
       timeout: 10s
       retries: 3
