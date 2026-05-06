@@ -45,6 +45,7 @@ except Exception as _patch_err:
 
 # ---------------------------------------------------------------------------
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import JSONResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,9 +60,9 @@ _PORT = int(os.environ.get("MFP_PORT", "8000"))
 mcp = FastMCP("myfitnesspal_mcp", host=_HOST, port=_PORT)
 
 # Add a simple health check endpoint for Docker/Traefik
-@mcp.app.get("/health")
-async def health_check():
-    return {"status": "ok"}
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    return JSONResponse({"status": "ok"})
 
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
