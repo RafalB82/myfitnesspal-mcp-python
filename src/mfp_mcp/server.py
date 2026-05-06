@@ -57,6 +57,13 @@ logger = logging.getLogger("mfp_mcp")
 _HOST = os.environ.get("MFP_HOST", "0.0.0.0")
 _PORT = int(os.environ.get("MFP_PORT", "8000"))
 
+# Window size for Camoufox (useful for VNC compatibility)
+_WINDOW_SIZE = os.environ.get("MFP_WINDOW_SIZE", "1280,720")
+try:
+    _WIDTH, _HEIGHT = map(int, _WINDOW_SIZE.split(","))
+except Exception:
+    _WIDTH, _HEIGHT = 1280, 720
+
 mcp = FastMCP("myfitnesspal_mcp", host=_HOST, port=_PORT)
 
 # Add a simple health check endpoint for Docker/Traefik
@@ -166,6 +173,7 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
         "persistent_context": True,
         "user_data_dir": str(BROWSER_PROFILE_DIR),
         "humanize": True,
+        "window": (_WIDTH, _HEIGHT),
     }
 
     async with AsyncCamoufox(**camoufox_args) as browser:
@@ -184,7 +192,7 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
                 logged_in = await page.query_selector("a[href*='logout'], .user-avatar, .nav-item-user")
                 if logged_in:
                     logger.info("Camoufox: persistent session is valid")
-                    raw_cookies = await browser.context.cookies()
+                    raw_cookies = await browser.cookies()
                     return {c["name"]: c["value"] for c in raw_cookies}
 
             if not username or not password:
@@ -196,7 +204,7 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
                     try:
                         await page.wait_for_url(lambda u: "login" not in u.lower(), timeout=120000)
                         logger.info("Manual login detected!")
-                        raw_cookies = await browser.context.cookies()
+                        raw_cookies = await browser.cookies()
                         return {c["name"]: c["value"] for c in raw_cookies}
                     except Exception as te:
                         raise RuntimeError(f"Manual login timeout: {te}")
@@ -226,7 +234,7 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
                 else:
                     raise RuntimeError("Login failed or blocked by Captcha in headless mode.")
 
-            raw_cookies = await browser.context.cookies()
+            raw_cookies = await browser.cookies()
             cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
             
             if "__Secure-next-auth.session-token" not in cookie_dict:
