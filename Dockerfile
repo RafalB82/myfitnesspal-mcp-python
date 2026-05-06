@@ -19,49 +19,29 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps: Firefox (Camoufox) + Xvfb + x11vnc + window manager
+# System deps: Essential build tools + Xvfb + x11vnc + window manager
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libffi-dev \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libdbus-1-3 \
-    libexpat1 \
-    libxcb1 \
-    libxkbcommon0 \
-    libx11-6 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1-0-0 \
-    libcairo2 \
-    libasound2 \
-    # Firefox specific
-    libgtk-3-0 \
-    libdbus-glib-1-2 \
-    libxt6 \
     # GUI / VNC
     xvfb \
     x11vnc \
     openbox \
     xterm \
+    curl \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-create X11 directory for non-root user
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
-# Install Python package + all deps
+# Install Python package + Playwright dependencies
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir -e . && \
-    python -m camoufox fetch
+    python -m camoufox fetch && \
+    npx playwright install-deps firefox && \
+    rm -rf /var/lib/apt/lists/*
 
 # Non-root user
 RUN useradd --create-home --shell /bin/bash mcp && \
