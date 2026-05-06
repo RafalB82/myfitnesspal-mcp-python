@@ -40,7 +40,7 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir -e . && \
     python -m camoufox fetch && \
-    npx playwright install-deps firefox && \
+    python -m playwright install-deps firefox && \
     rm -rf /var/lib/apt/lists/*
 
 # Non-root user
