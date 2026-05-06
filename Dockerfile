@@ -1,7 +1,8 @@
 # MyFitnessPal MCP Server — Docker image
 #
-# Auth uses Playwright HEADED Chromium via Xvfb virtual display.
+# Auth uses Camoufox (stealthy Firefox) via Xvfb virtual display.
 # VNC server (port 5900) allows manual reCAPTCHA interaction on first login.
+# Browser profile is persisted in /home/mcp/.mfp_mcp/browser_profile.
 #
 # Build:  docker compose build --no-cache mfp-mcp
 # Run:    docker compose up -d mfp-mcp
@@ -18,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps: Playwright Chromium + Xvfb + x11vnc + window manager
+# System deps: Firefox (Camoufox) + Xvfb + x11vnc + window manager
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libffi-dev \
@@ -42,6 +43,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
+    # Firefox specific
+    libgtk-3-0 \
+    libdbus-glib-1-2 \
+    libxt6 \
+    # GUI / VNC
     xvfb \
     x11vnc \
     openbox \
@@ -52,11 +58,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir -e . && \
-    playwright install chromium
+    python -m camoufox fetch
 
 # Non-root user
 RUN useradd --create-home --shell /bin/bash mcp && \
-    mkdir -p /home/mcp/.mfp_mcp && \
+    mkdir -p /home/mcp/.mfp_mcp/browser_profile && \
     chown -R mcp:mcp /home/mcp/.mfp_mcp && \
     chown -R mcp:mcp /opt/playwright 2>/dev/null || true
 
