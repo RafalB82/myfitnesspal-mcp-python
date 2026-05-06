@@ -33,7 +33,7 @@ services:
       - "traefik.http.services.mfp-mcp.loadbalancer.server.port=8000"
     networks:
       - mfp_network
-      - ${TRAEFIK_NETWORK:-traefik}
+      - traefik
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/mcp"]
       interval: 1m
