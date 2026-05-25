@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xterm \
     curl \
     gnupg \
+    # Cron for periodic MFP sync
+    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-create X11 directory for non-root user

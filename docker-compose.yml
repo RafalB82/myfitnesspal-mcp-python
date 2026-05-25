@@ -17,6 +17,11 @@ services:
       
       # VNC Display
       - DISPLAY=:99
+      
+      # MFP sync schedule (cron expression); empty = no periodic sync
+      - MFP_SYNC_SCHEDULE=${MFP_SYNC_SCHEDULE:-0 6,14,22 * * *}
+      # Number of days to sync each run
+      - MFP_SYNC_DAYS=${MFP_SYNC_DAYS:-30}
     ports:
       - "8000:8000"
       - "5900:5900"
@@ -25,6 +30,8 @@ services:
       - mfp_cookies:/home/mcp/.mfp_mcp
       # NEW: Persistent Browser Profile (Camoufox/Firefox session)
       - mfp_browser_profile:/home/mcp/.mfp_mcp/browser_profile
+      # NEW: SQLite cache persists across restarts
+      - mfp_cache:/home/mcp/.mfp_mcp
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.mfp-mcp.rule=Host(`${DOMAIN}`)"
@@ -48,6 +55,7 @@ services:
 volumes:
   mfp_cookies:
   mfp_browser_profile:
+  mfp_cache:
 
 networks:
   mfp_network:

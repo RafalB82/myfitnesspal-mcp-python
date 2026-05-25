@@ -27,6 +27,9 @@ import time
 import httpx
 from pydantic import BaseModel, Field, ConfigDict
 
+from mfp_mcp.cache import MFPCache
+
+
 # ---------------------------------------------------------------------------
 try:
     from mcp.server.transport_security import TransportSecurityMiddleware as _TSM
@@ -74,6 +77,15 @@ async def health_check(request):
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 BROWSER_PROFILE_DIR = CONFIG_DIR / "browser_profile"
+
+# SQLite cache instance (lazily initialised on first use)
+_cache: Optional[MFPCache] = None
+
+def get_cache() -> MFPCache:
+    global _cache
+    if _cache is None:
+        _cache = MFPCache(CONFIG_DIR)
+    return _cache
 
 # Detect if Xvfb virtual display is available
 _DISPLAY = os.environ.get("DISPLAY", "")
@@ -465,12 +477,53 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
 
 @mcp.tool(name="mfp_get_diary")
 async def mfp_get_diary(params: GetDiaryInput) -> str:
-    """Get the food diary for a specific date."""
+    """Get the food diary for a specific date.
+
+    Reads from the local SQLite cache when available (fast, ~10ms).
+    Falls back to live MFP API when the date hasn't been synced yet.
+    """
     try:
-        client = await get_mfp_client_async()
         target_date = parse_date(params.date)
+        cache = get_cache()
+
+        # 1. Try cache first
+        daily = cache.get_diary_date(target_date)
+        if daily is not None:
+            # Build the response from cache
+            entries = cache.get_diary_entries(target_date)
+            meals: Dict[str, Any] = {}
+            for e in entries:
+                meal_name = e["meal"]
+                if meal_name not in meals:
+                    meals[meal_name] = {"entries": [], "totals": {}}
+                meals[meal_name]["entries"].append({
+                    "name": e["food_name"],
+                    "nutrition": {
+                        "calories": e["calories"],
+                        "protein": e["protein"],
+                        "carbohydrates": e["carbs"],
+                        "fat": e["fat"],
+                        "fiber": e["fiber"],
+                        "sugar": e["sugar"],
+                        "sodium": e["sodium"],
+                    },
+                })
+            data = {
+                "date": str(target_date),
+                "meals": meals,
+                "daily_totals": {
+                    k: v for k, v in daily.items()
+                    if k not in ("date", "updated_at", "water_ml")
+                },
+                "water": daily.get("water_ml"),
+                "source": "cache",
+            }
+            return format_response(data, params.response_format, f"Food Diary for {target_date}")
+
+        # 2. Fallback: live MFP
+        client = await get_mfp_client_async()
         day = client.get_date(target_date)
-        data = {"date": str(target_date), "meals": {}, "daily_totals": {}, "daily_goals": day.goals, "water": day.water, "notes": day.notes or ""}
+        data = {"date": str(target_date), "meals": {}, "daily_totals": {}, "daily_goals": day.goals, "water": day.water, "notes": day.notes or "", "source": "live"}
         for meal in day.meals:
             data["meals"][meal.name] = {"entries": [format_meal_entry(entry) for entry in meal.entries], "totals": format_nutrition_dict(meal.totals)}
         totals = {}
@@ -504,13 +557,26 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
 
 @mcp.tool(name="mfp_get_measurements")
 async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
-    """Get body measurements over a date range."""
+    """Get body measurements over a date range.
+
+    Reads from the local SQLite cache when available (fast, ~10ms).
+    Falls back to live MFP API when the data hasn't been synced.
+    """
     try:
-        client = await get_mfp_client_async()
         end = parse_date(params.end_date)
         start = parse_date(params.start_date) if params.start_date else end - timedelta(days=30)
+        cache = get_cache()
+
+        # 1. Try cache first
+        cached = cache.get_measurements(params.measurement, start, end)
+        if cached:
+            values = {r["date"]: r["value"] for r in cached}
+            return format_response({"values": values, "source": "cache"}, params.response_format, f"{params.measurement} History")
+
+        # 2. Fallback: live MFP
+        client = await get_mfp_client_async()
         measurements = client.get_measurements(params.measurement, start, end)
-        return format_response({"values": ordered_dict_to_dict(measurements)}, params.response_format, f"{params.measurement} History")
+        return format_response({"values": ordered_dict_to_dict(measurements), "source": "live"}, params.response_format, f"{params.measurement} History")
     except Exception as e: return f"Error getting measurements: {str(e)}"
 
 @mcp.tool(name="mfp_set_measurement")
@@ -519,6 +585,8 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
     try:
         client = await get_mfp_client_async()
         client.set_measurements(params.measurement, params.value)
+        # Update local cache immediately
+        get_cache().upsert_measurement(date.today(), params.measurement, params.value)
         return f"Successfully logged {params.measurement}: {params.value}"
     except Exception as e: return f"Error setting measurement: {str(e)}"
 
@@ -529,6 +597,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         add_food_to_diary(client=client, mfp_id=params.mfp_id, meal=params.meal, target_date=target_date, quantity=params.quantity, unit=params.unit)
+        # Invalidate cache so next sync picks up the change
+        get_cache().mark_synced(target_date, status="stale")
         return f"Successfully added {params.mfp_id} to {params.meal}"
     except Exception as e: return f"Error adding food to diary: {str(e)}"
 
@@ -539,6 +609,8 @@ async def mfp_set_water(params: SetWaterInput) -> str:
         client = await get_mfp_client_async()
         target_date = parse_date(params.date)
         set_water_intake(client=client, target_date=target_date, cups=params.cups)
+        # Invalidate cache so next sync picks up the change
+        get_cache().mark_synced(target_date, status="stale")
         return f"Successfully logged {params.cups} cups of water"
     except Exception as e: return f"Error setting water intake: {str(e)}"
 
