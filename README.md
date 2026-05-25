@@ -74,23 +74,50 @@ Uses `~/.mfp_mcp/cookies.json` — falls back to MCP server (via Camoufox, ~23s)
 ## Architecture
 
 ```
-┌─────────────────────────┐     streamable-http      ┌──────────────────────┐
-│  AI Assistant (Claude,  │ ◄──────────────────────► │  MFP MCP Server      │
-│  Perplexity, OpenClaw)  │      POST /mcp           │  port 8000           │
-└─────────────────────────┘                          │  Camoufox auth       │
-                                                     │                      │
-              ┌──────────────────────────────────────┤  Docker container    │
-              │                                      │  Xvfb + x11vnc      │
-              ▼                                      └──────────────────────┘
-     ┌───────────────┐                                         │
-     │ mfp_quick.py  │  cookies-first (~3s)                    │
-     │ (host side)   │─────────────────────────────────────────┤
-     └───────────────┘           HTTP                           ▼
-                                                        ┌──────────────┐
-                                                        │ myfitnesspal │
-                                                        │   .com API   │
-                                                        └──────────────┘
+┌─────────────────────────┐     streamable-http      ┌────────────────────────────────────┐
+│  AI Assistant (Claude,  │ ◄──────────────────────► │  MFP MCP Server                    │
+│  Perplexity, OpenClaw)  │      POST /mcp           │  port 8000                         │
+└─────────────────────────┘                          │                                    │
+                                                     │  ┌────────────────┐  ┌───────────┐  │
+              ┌──────────────────────────────────────┤  │  SQLite Cache  │  │ Camoufox  │  │
+              │                                      │  │  (mfp_cache.db)│  │ (auth)    │  │
+              ▼                                      │  └───────┬────────┘  └─────┬─────┘  │
+     ┌───────────────┐                               └─────────┼────────────────────┼────────┘
+     │ mfp_quick.py  │  cookies-first (~3s)                    │                    │
+     │ (host side)   │─────────────────────────────────────────┤                    │
+     └───────────────┘                                          ▼                    ▼
+                                                         ┌──────────────┐   ┌──────────────┐
+                                                         │ myfitnesspal │   │  Background  │
+                                                         │   .com API   │   │  Sync (cron) │
+                                                         └──────────────┘   └──────┬───────┘
+                                                                                   │
+                                                                                   ▼
+                                                                           ┌──────────────┐
+                                                                           │  SQLite Cache│
+                                                                           │  (same db)   │
+                                                                           └──────────────┘
 ```
+
+### Read path (fast path)
+
+```
+AI Agent → mfp_get_diary / mfp_get_measurements
+         → SQLite cache (sub‑ms response)
+         → fallback: live MFP via Camoufox (only if date is not synced)
+```
+
+### Data freshness (background sync)
+
+A cron job inside the container syncs MFP data into SQLite 3 times per day
+(default schedule: 06:00, 14:00, 22:00). An initial sync runs on container start.
+
+Write tools (`mfp_set_measurement`, `mfp_add_food_to_diary`, `mfp_set_water`)
+mark affected dates as `stale` — the next sync run picks them up automatically.
+
+This means:
+- **AI agents get answers in milliseconds** — no 20‑second Camoufox delay per query
+- **Data is never older than ~8 hours** at worst (between sync runs)
+- **No change to the authentication flow** — sync uses the same cookies/Camoufox chain
 
 ### Transports
 
@@ -114,6 +141,8 @@ Uses `~/.mfp_mcp/cookies.json` — falls back to MCP server (via Camoufox, ~23s)
 | `DOMAIN` | — | Public domain for Traefik |
 | `CERT_RESOLVER` | `letsencrypt` | Traefik certresolver |
 | `TRAEFIK_NETWORK` | `traefik` | Docker network for Traefik |
+| `MFP_SYNC_SCHEDULE` | `0 6,14,22 * * *` | Cron expression for background sync |
+| `MFP_SYNC_DAYS` | `30` | Number of days to sync each run |
 
 ### Volumes
 
@@ -121,6 +150,7 @@ Uses `~/.mfp_mcp/cookies.json` — falls back to MCP server (via Camoufox, ~23s)
 |--------|-------|---------|
 | `mfp_cookies` | `/home/mcp/.mfp_mcp` | Cookies.json persistence |
 | `mfp_browser_profile` | `/home/mcp/.mfp_mcp/browser_profile` | Full Firefox profile (persistent login) |
+| `mfp_cache` | `/home/mcp/.mfp_mcp` | SQLite cache database (mfp_cache.db) |
 
 ### Traefik reverse proxy
 
@@ -158,9 +188,9 @@ docker compose up -d --build
 ```
 myfitnesspal-mcp-python/
 ├── .env.example               # Environment template
-├── docker-compose.yml         # Traefik, VNC, volumes
-├── Dockerfile                 # python:3.12-slim + Camoufox + Xvfb
-├── entrypoint.sh              # Xvfb → openbox → x11vnc → MFP server
+├── docker-compose.yml         # Traefik, VNC, volumes, sync config
+├── Dockerfile                 # python:3.12-slim + Camoufox + Xvfb + cron
+├── entrypoint.sh              # Xvfb → openbox → x11vnc → cron → MFP server
 ├── pyproject.toml
 ├── README.md
 ├── mfp_quick.py               # Fast cookie-based reader (~3s)
@@ -168,8 +198,29 @@ myfitnesspal-mcp-python/
 └── src/
     └── mfp_mcp/
         ├── __init__.py
-        └── server.py          # Main MCP server (FastMCP)
+        ├── server.py          # Main MCP server (FastMCP)
+        ├── cache.py           # SQLite cache — MFPCache class
+        └── sync.py            # Background sync script (python -m mfp_mcp.sync)
 ```
+
+## Manual sync
+
+```bash
+# Inside the running container
+docker exec mfp-mcp python -m mfp_mcp.sync --days 7
+
+# Options:
+#   --days N          Number of days to sync (default: 14)
+#   --end-date YYYY-MM-DD  End date (default: today)
+#   --force           Re-sync already synced dates
+#
+# Examples:
+#   python -m mfp_mcp.sync --days 30
+#   python -m mfp_mcp.sync --days 90 --end-date 2025-12-31 --force
+```
+
+The sync script authenticates via stored cookies first (sub‑second),
+falling back to Camoufox only if cookies are expired.
 
 ## Troubleshooting
 
@@ -190,6 +241,12 @@ Relogin if needed.
 ### Write tools return 404
 MFP migrated to GraphQL API — write endpoints removed. Use the MFP website/app.
 Read tools continue to work.
+
+### Data is stale / missing recent days
+The cron sync runs 3x/day. You can trigger an immediate sync:
+```bash
+docker exec mfp-mcp python -m mfp_mcp.sync --days 7 --force
+```
 
 ## License
 
