@@ -11,16 +11,33 @@ git clone https://github.com/RafalB82/myfitnesspal-mcp-python.git
 cd myfitnesspal-mcp-python
 cp .env.example .env   # fill in your MFP credentials
 
-# 2. Build & run (Docker)
-docker compose up -d --build
+# 2. Build
+docker build -t mfp-mcp .
 
-# 3. First login — VNC (port 5900, password: mfpvnc)
+# 3. Run (mount local .mfp_mcp for cookies & cache persistence)
+docker run -d --name mfp-mcp \
+  --restart unless-stopped \
+  -p 8000:8000 -p 5900:5900 \
+  -v ~/.mfp_mcp:/home/mcp/.mfp_mcp \
+  -e MFP_USERNAME="$(grep MFP_USERNAME .env | cut -d= -f2)" \
+  -e MFP_PASSWORD="$(grep MFP_PASSWORD .env | cut -d= -f2)" \
+  -e MFP_SYNC_DAYS=90 \
+  mfp-mcp
+
+# Or with docker compose (for Traefik reverse proxy):
+# docker compose up -d --build
+
+# 4. First login — VNC (port 5900, password: mfpvnc)
 #    Open VNC client to <host>:5900, complete reCAPTCHA if shown.
-#    Once logged in, the session persists automatically.
+#    Timeout: 5 minutes. Once logged in, cookies are saved to ~/.mfp_mcp/cookies.json
+#    and the background sync starts automatically.
 
-# 4. Verify
+# 5. Verify
 curl -s http://localhost:8000/health
 # → {"status":"ok"}
+
+# 6. Trigger initial sync (optional — already runs on startup)
+docker exec mfp-mcp python -m mfp_mcp.sync --days 90 --force
 ```
 
 ## Authentication
@@ -36,11 +53,19 @@ The server uses **Camoufox** (stealth-hardened Firefox fork) for auth:
 
 ### First-time VNC login
 
+On first run (or when cookies expire after ~30 days):
+
+1. Container starts, Camoufox Firefox opens on `:99` display
+2. Server detects no valid session → waits **5 minutes** for manual login
+3. Connect VNC to `<host>:5900` (password: `mfpvnc`)
+4. Complete login + reCAPTCHA in the Firefox window
+5. Server auto-detects successful login → saves cookies to `~/.mfp_mcp/cookies.json`
+6. Background sync starts automatically (90 days by default)
+
 ```bash
-# Server running, connect VNC to <host>:5900
-# password: mfpvnc
-# Complete login in the Firefox window
-# Session is saved permanently in the browser_profile volume
+# After VNC login, cookies are persisted on host:
+ls -la ~/.mfp_mcp/cookies.json   # 13 cookies, valid ~30 days
+ls -la ~/.mfp_mcp/mfp_cache.db   # SQLite database with cached data
 ```
 
 ## Tools
