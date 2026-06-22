@@ -211,10 +211,10 @@ async def authenticate_with_camoufox_async(username: Optional[str] = None, passw
                 logger.warning("No valid session and no credentials provided. Please log in via VNC.")
                 # If in headed mode, we can wait for manual login
                 if _USE_HEADED:
-                    logger.info("WAITING FOR MANUAL LOGIN VIA VNC (120s timeout)...")
+                    logger.info("WAITING FOR MANUAL LOGIN VIA VNC (300s timeout)...")
                     await page.goto("https://www.myfitnesspal.com/account/login")
                     try:
-                        await page.wait_for_url(lambda u: "login" not in u.lower(), timeout=120000)
+                        await page.wait_for_url(lambda u: "login" not in u.lower(), timeout=300000)
                         logger.info("Manual login detected!")
                         raw_cookies = await browser.cookies()
                         return {c["name"]: c["value"] for c in raw_cookies}
