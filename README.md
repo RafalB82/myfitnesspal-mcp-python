@@ -45,19 +45,16 @@ The server uses **Camoufox** (stealth-hardened Firefox fork) for auth:
 
 ## Tools
 
-| Tool | Status | Description |
-|------|--------|-------------|
-| `mfp_get_diary` | ✅ Works | Get food diary for any date |
-| `mfp_search_food` | ✅ Works | Search the MFP food database |
-| `mfp_get_food_details` | ✅ Works | Detailed nutrition for a food item |
-| `mfp_get_measurements` | ✅ Works | Weight / body measurement history |
-| `mfp_set_measurement` | ❌ 404 | MFP API changed — write endpoint no longer available |
-| `mfp_add_food_to_diary` | ❌ 404 | MFP API changed — write endpoint no longer available |
-| `mfp_set_water` | ❌ 404 | MFP API changed — write endpoint no longer available |
+| Tool | Description |
+|------|-------------|
+| `mfp_get_diary` | Get food diary for any date — cache-first (sub-ms), fallback to live MFP |
+| `mfp_search_food` | Search the MFP food database (live only) |
+| `mfp_get_food_details` | Detailed nutrition for a food item (live only) |
+| `mfp_get_measurements` | Body measurement history — cache-first (sub-ms), fallback to live MFP |
 
-> **Read tools work. Write tools are broken** — MyFitnessPal migrated to a GraphQL/API backend
-> and the old form-based URLs (`/food/diary/{user}/add`, `/food/diary/{user}/water`) no longer exist.
-> Use the MFP website or app to log food/water.
+> **Read-only** — MyFitnessPal migrated to a GraphQL backend and the old form-based write
+> endpoints no longer exist. Use the MFP website or app to log food/water/measurements.
+> The background sync picks up changes made in the app within ~8 hours.
 
 ## Fast Reader — `mfp_quick.py`
 
@@ -111,8 +108,7 @@ AI Agent → mfp_get_diary / mfp_get_measurements
 A cron job inside the container syncs MFP data into SQLite 3 times per day
 (default schedule: 06:00, 14:00, 22:00). An initial sync runs on container start.
 
-Write tools (`mfp_set_measurement`, `mfp_add_food_to_diary`, `mfp_set_water`)
-mark affected dates as `stale` — the next sync run picks them up automatically.
+Data changes made through the MFP app/website are picked up by the next sync run.
 
 This means:
 - **AI agents get answers in milliseconds** — no 20‑second Camoufox delay per query
@@ -237,10 +233,6 @@ docker exec -u root mfp-mcp chown mcp:mcp /home/mcp/.mfp_mcp/cookies.json
 ### `All authentication methods failed`
 VNC to port 5900 (password: `mfpvnc`), check if logged into myfitnesspal.com.
 Relogin if needed.
-
-### Write tools return 404
-MFP migrated to GraphQL API — write endpoints removed. Use the MFP website/app.
-Read tools continue to work.
 
 ### Data is stale / missing recent days
 The cron sync runs 3x/day. You can trigger an immediate sync:

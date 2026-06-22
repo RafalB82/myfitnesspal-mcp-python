@@ -2,13 +2,14 @@
 SQLite cache for MyFitnessPal data.
 
 Provides a local store for diary entries, daily aggregates, measurements,
-and sync metadata.  Tools read from here (fast), a background sync
-process writes to here.
+daily goals, and sync metadata.  Tools read from here (fast, sub-ms),
+a background sync process writes to here.
 
 Schema
 ------
   diary_entries   — one row per food entry per meal per day
-  diary_daily     — aggregated daily totals (calories, macros, water)
+  diary_daily     — aggregated daily totals + water (cups) + notes
+  daily_goals     — nutrition goals per day (calorie/macro targets)
   measurements    — body measurements by date and type
   sync_meta       — which dates have been synced and their status
 """
@@ -16,14 +17,13 @@ Schema
 from __future__ import annotations
 
 import sqlite3
-import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 DB_FILENAME = "mfp_cache.db"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def _get_db_path(cache_dir: Path) -> Path:
@@ -38,6 +38,7 @@ class MFPCache:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._db: sqlite3.Connection | None = None
         self._init_db()
+        self._migrate()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -68,6 +69,8 @@ class MFPCache:
                 entry_id     INTEGER NOT NULL,
                 food_name    TEXT,
                 brand        TEXT,
+                quantity     REAL,
+                unit         TEXT,
                 calories     REAL,
                 protein      REAL,
                 carbs        REAL,
@@ -87,8 +90,20 @@ class MFPCache:
                 fiber        REAL,
                 sugar        REAL,
                 sodium       REAL,
-                water_ml     REAL,
+                water_cups   REAL,
+                notes        TEXT,
                 updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_goals (
+                date         TEXT PRIMARY KEY,
+                calories     REAL,
+                protein      REAL,
+                carbs        REAL,
+                fat          REAL,
+                fiber        REAL,
+                sugar        REAL,
+                sodium       REAL
             );
 
             CREATE TABLE IF NOT EXISTS measurements (
@@ -112,13 +127,66 @@ class MFPCache:
                 ON measurements(type);
         """)
 
-        # Schema version tracking for future migrations
+        # Insert initial schema version if empty
         cur = conn.execute("SELECT version FROM schema_version")
         row = cur.fetchone()
         if row is None:
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
         conn.commit()
         conn.close()
+
+    def _migrate(self) -> None:
+        """Handle schema migrations from v1 to v2."""
+        conn = self._get_conn()
+        cur = conn.execute("SELECT version FROM schema_version")
+        row = cur.fetchone()
+        current_version = row["version"] if row else 1
+
+        if current_version < 2:
+            # v1 → v2: add water_cups, notes to diary_daily; add daily_goals table;
+            # add quantity, unit to diary_entries
+            try:
+                conn.execute("ALTER TABLE diary_daily ADD COLUMN water_cups REAL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            try:
+                conn.execute("ALTER TABLE diary_daily ADD COLUMN notes TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE diary_entries ADD COLUMN quantity REAL")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE diary_entries ADD COLUMN unit TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_goals (
+                    date         TEXT PRIMARY KEY,
+                    calories     REAL,
+                    protein      REAL,
+                    carbs        REAL,
+                    fat          REAL,
+                    fiber        REAL,
+                    sugar        REAL,
+                    sodium       REAL
+                )
+            """)
+
+            # Migrate water_ml → water_cups (1 cup = 237 ml)
+            try:
+                conn.execute("""
+                    UPDATE diary_daily
+                    SET water_cups = ROUND(water_ml / 237.0, 1)
+                    WHERE water_ml IS NOT NULL AND water_cups IS NULL
+                """)
+            except sqlite3.OperationalError:
+                pass
+
+            conn.execute("UPDATE schema_version SET version = 2")
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Diary
@@ -129,9 +197,11 @@ class MFPCache:
         target_date: date,
         meals_data: List[Dict[str, Any]],
         daily_totals: Dict[str, float],
-        water_ml: float | None = None,
+        water_cups: float | None = None,
+        notes: str | None = None,
+        goals: Dict[str, float] | None = None,
     ) -> None:
-        """Replace all entries + daily totals for a single date."""
+        """Replace all entries + daily totals + goals for a single date."""
         conn = self._get_conn()
         date_str = target_date.isoformat()
         now = datetime.utcnow().isoformat()
@@ -140,20 +210,23 @@ class MFPCache:
         conn.execute("DELETE FROM diary_entries WHERE date = ?", (date_str,))
 
         # Insert current entries
+        entry_idx = 0
         for meal in meals_data:
             meal_name = meal.get("name", "unknown")
             for entry in meal.get("entries", []):
                 conn.execute(
                     """INSERT INTO diary_entries
-                       (date, meal, entry_id, food_name, brand,
+                       (date, meal, entry_id, food_name, brand, quantity, unit,
                         calories, protein, carbs, fat, fiber, sugar, sodium)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         date_str,
                         meal_name,
-                        entry.get("mfp_id", 0),
+                        entry_idx,
                         entry.get("name"),
                         entry.get("brand"),
+                        entry.get("quantity"),
+                        entry.get("unit"),
                         entry.get("calories"),
                         entry.get("protein"),
                         entry.get("carbohydrates"),
@@ -163,13 +236,14 @@ class MFPCache:
                         entry.get("sodium"),
                     ),
                 )
+                entry_idx += 1
 
         # Upsert daily totals
         conn.execute(
             """INSERT OR REPLACE INTO diary_daily
                (date, calories, protein, carbs, fat, fiber, sugar, sodium,
-                water_ml, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                water_cups, notes, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 date_str,
                 daily_totals.get("calories"),
@@ -179,10 +253,29 @@ class MFPCache:
                 daily_totals.get("fiber"),
                 daily_totals.get("sugar"),
                 daily_totals.get("sodium"),
-                water_ml,
+                water_cups,
+                notes,
                 now,
             ),
         )
+
+        # Upsert daily goals
+        if goals:
+            conn.execute(
+                """INSERT OR REPLACE INTO daily_goals
+                   (date, calories, protein, carbs, fat, fiber, sugar, sodium)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    date_str,
+                    goals.get("calories"),
+                    goals.get("protein"),
+                    goals.get("carbohydrates"),
+                    goals.get("fat"),
+                    goals.get("fiber"),
+                    goals.get("sugar"),
+                    goals.get("sodium"),
+                ),
+            )
 
         conn.commit()
 
@@ -209,7 +302,7 @@ class MFPCache:
     def get_diary_entries(
         self, target_date: date
     ) -> List[Dict]:
-        """Return detailed entries for a single date, grouped by meal."""
+        """Return detailed entries for a single date."""
         conn = self._get_conn()
         rows = conn.execute(
             """SELECT * FROM diary_entries
@@ -218,6 +311,21 @@ class MFPCache:
             (target_date.isoformat(),),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Daily goals
+    # ------------------------------------------------------------------
+
+    def get_daily_goals(self, target_date: date) -> Dict[str, float]:
+        """Return nutrition goals for a date, or empty dict."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM daily_goals WHERE date = ?",
+            (target_date.isoformat(),),
+        ).fetchone()
+        if row is None:
+            return {}
+        return {k: v for k, v in dict(row).items() if k != "date" and v is not None}
 
     # ------------------------------------------------------------------
     # Measurements
@@ -289,12 +397,24 @@ class MFPCache:
         return [r["date"] for r in rows]
 
     def is_synced(self, target_date: date) -> bool:
+        """Return True if date is synced with status 'complete'."""
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT 1 FROM sync_meta WHERE date = ?",
+            "SELECT status FROM sync_meta WHERE date = ?",
             (target_date.isoformat(),),
         ).fetchone()
-        return row is not None
+        return row is not None and row["status"] == "complete"
+
+    def needs_resync(self, target_date: date) -> bool:
+        """Return True if date needs re-sync (stale, missing, or status=missing)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT status FROM sync_meta WHERE date = ?",
+            (target_date.isoformat(),),
+        ).fetchone()
+        if row is None:
+            return True  # never synced
+        return row["status"] != "complete"
 
     # ------------------------------------------------------------------
     # Cleanup

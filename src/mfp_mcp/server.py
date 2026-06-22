@@ -394,93 +394,71 @@ class GetMeasurementsInput(BaseModel):
     end_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
-class SetMeasurementInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    measurement: str = Field(default="Weight")
-    value: float = Field(..., gt=0)
 
-class GetExercisesInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
-class GetGoalsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
-class SetGoalsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    calories: Optional[int] = Field(default=None, ge=500, le=10000)
-    protein: Optional[int] = Field(default=None, ge=0)
-    carbohydrates: Optional[int] = Field(default=None, ge=0)
-    fat: Optional[int] = Field(default=None, ge=0)
 
-class GetWaterInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+def _build_diary_from_cache(target_date: date, daily: Dict, entries: List[Dict], goals: Dict) -> Dict[str, Any]:
+    """Build the standard diary response dict from cached data."""
+    meals: Dict[str, Any] = {}
+    meal_totals: Dict[str, Dict[str, float]] = {}
 
-class GetReportInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    report_name: str = Field(default="Net Calories")
-    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    end_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+    for e in entries:
+        meal_name = e["meal"]
+        if meal_name not in meals:
+            meals[meal_name] = {"entries": [], "totals": {}}
+            meal_totals[meal_name] = {}
 
-class AddFoodToDiaryInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    mfp_id: str = Field(...)
-    meal: str = Field(default="Breakfast")
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    quantity: float = Field(default=1.0, gt=0)
-    unit: Optional[str] = Field(default=None)
+        entry = {
+            "name": e["food_name"],
+            "brand": e.get("brand"),
+            "quantity": e.get("quantity"),
+            "unit": e.get("unit"),
+            "nutrition": {
+                "calories": e["calories"],
+                "protein": e["protein"],
+                "carbohydrates": e["carbs"],
+                "fat": e["fat"],
+                "fiber": e["fiber"],
+                "sugar": e["sugar"],
+                "sodium": e["sodium"],
+            },
+        }
+        meals[meal_name]["entries"].append(entry)
 
-class SetWaterInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    cups: float = Field(..., ge=0, le=50)
-    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+        # Accumulate per-meal totals
+        for k in ("calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium"):
+            v = e.get(k) or 0
+            meal_totals[meal_name][k] = meal_totals[meal_name].get(k, 0) + v
 
-# ============================================================================
+    # Normalize keys to match live MFP format
+    totals_keys = ["calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium"]
+    daily_totals = {k: daily.get(k, 0) or 0 for k in totals_keys}
 
-def add_food_to_diary(client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None) -> None:
-    from urllib import parse
-    date_str = target_date.strftime("%Y-%m-%d")
-    diary_url = parse.urljoin(client.BASE_URL_SECURE, f"food/diary/{client.effective_username}?date={date_str}")
-    document = client._get_document_for_url(diary_url)
-    authenticity_token = document.xpath("(//input[@name='authenticity_token']/@value)[1]")
-    if not authenticity_token:
-        raise RuntimeError("Could not find authenticity token on diary page")
-    authenticity_token = authenticity_token[0]
-    meal_map = {"breakfast": "0", "lunch": "1", "dinner": "2", "snacks": "3", "snack": "3"}
-    meal_index = meal_map.get(meal.lower(), "0")
-    add_food_url = parse.urljoin(client.BASE_URL_SECURE, f"food/diary/{client.effective_username}/add")
-    post_data = {"authenticity_token": authenticity_token, "date": date_str, "meal": meal_index, "food_id": mfp_id, "quantity": str(quantity)}
-    if unit: post_data["unit"] = unit
-    headers = {"Referer": diary_url, "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest"}
-    response = client.session.post(add_food_url, data=post_data, headers=headers)
-    response.raise_for_status()
+    for meal_name in meals:
+        meals[meal_name]["totals"] = meal_totals.get(meal_name, {})
 
-def set_water_intake(client, target_date: date, cups: float) -> None:
-    from urllib import parse
-    date_str = target_date.strftime("%Y-%m-%d")
-    diary_url = parse.urljoin(client.BASE_URL_SECURE, f"food/diary/{client.effective_username}?date={date_str}")
-    document = client._get_document_for_url(diary_url)
-    authenticity_token = document.xpath("(//input[@name='authenticity_token']/@value)[1]")
-    if not authenticity_token:
-        raise RuntimeError("Could not find authenticity token on diary page")
-    authenticity_token = authenticity_token[0]
-    water_url = parse.urljoin(client.BASE_URL_SECURE, f"food/diary/{client.effective_username}/water")
-    post_data = {"authenticity_token": authenticity_token, "date": date_str, "water": str(cups)}
-    headers = {"Referer": diary_url, "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest"}
-    response = client.session.post(water_url, data=post_data, headers=headers)
-    response.raise_for_status()
+    # Water: stored as cups in cache
+    water_cups = daily.get("water_cups", 0) or 0
+
+    data = {
+        "date": str(target_date),
+        "meals": meals,
+        "daily_totals": daily_totals,
+        "daily_goals": goals,
+        "water": {"cups": water_cups},
+        "notes": daily.get("notes") or "",
+        "source": "cache",
+    }
+    return data
+
 
 @mcp.tool(name="mfp_get_diary")
 async def mfp_get_diary(params: GetDiaryInput) -> str:
     """Get the food diary for a specific date.
 
     Reads from the local SQLite cache when available (fast, ~10ms).
-    Falls back to live MFP API when the date hasn't been synced yet.
+    Falls back to live MFP API only when the date hasn't been synced yet.
     """
     try:
         target_date = parse_date(params.date)
@@ -489,43 +467,28 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         # 1. Try cache first
         daily = cache.get_diary_date(target_date)
         if daily is not None:
-            # Build the response from cache
             entries = cache.get_diary_entries(target_date)
-            meals: Dict[str, Any] = {}
-            for e in entries:
-                meal_name = e["meal"]
-                if meal_name not in meals:
-                    meals[meal_name] = {"entries": [], "totals": {}}
-                meals[meal_name]["entries"].append({
-                    "name": e["food_name"],
-                    "nutrition": {
-                        "calories": e["calories"],
-                        "protein": e["protein"],
-                        "carbohydrates": e["carbs"],
-                        "fat": e["fat"],
-                        "fiber": e["fiber"],
-                        "sugar": e["sugar"],
-                        "sodium": e["sodium"],
-                    },
-                })
-            data = {
-                "date": str(target_date),
-                "meals": meals,
-                "daily_totals": {
-                    k: v for k, v in daily.items()
-                    if k not in ("date", "updated_at", "water_ml")
-                },
-                "water": daily.get("water_ml"),
-                "source": "cache",
-            }
+            goals = cache.get_daily_goals(target_date)
+            data = _build_diary_from_cache(target_date, daily, entries, goals)
             return format_response(data, params.response_format, f"Food Diary for {target_date}")
 
-        # 2. Fallback: live MFP
+        # 2. Fallback: live MFP (slow — authenticate + fetch)
         client = await get_mfp_client_async()
         day = client.get_date(target_date)
-        data = {"date": str(target_date), "meals": {}, "daily_totals": {}, "daily_goals": day.goals, "water": day.water, "notes": day.notes or "", "source": "live"}
+        data = {
+            "date": str(target_date),
+            "meals": {},
+            "daily_totals": {},
+            "daily_goals": day.goals,
+            "water": day.water,
+            "notes": day.notes or "",
+            "source": "live",
+        }
         for meal in day.meals:
-            data["meals"][meal.name] = {"entries": [format_meal_entry(entry) for entry in meal.entries], "totals": format_nutrition_dict(meal.totals)}
+            data["meals"][meal.name] = {
+                "entries": [format_meal_entry(entry) for entry in meal.entries],
+                "totals": format_nutrition_dict(meal.totals),
+            }
         totals = {}
         for entry in day.entries:
             for key, value in entry.totals.items():
@@ -533,7 +496,8 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
                 totals[key] = totals.get(key, 0) + val
         data["daily_totals"] = totals
         return format_response(data, params.response_format, f"Food Diary for {target_date}")
-    except Exception as e: return f"Error retrieving diary: {str(e)}"
+    except Exception as e:
+        return f"Error retrieving diary: {str(e)}"
 
 @mcp.tool(name="mfp_search_food")
 async def mfp_search_food(params: SearchFoodInput) -> str:
@@ -571,48 +535,24 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         cached = cache.get_measurements(params.measurement, start, end)
         if cached:
             values = {r["date"]: r["value"] for r in cached}
-            return format_response({"values": values, "source": "cache"}, params.response_format, f"{params.measurement} History")
+            return format_response(
+                {"measurement": params.measurement, "values": values, "source": "cache"},
+                params.response_format,
+                f"{params.measurement} History",
+            )
 
         # 2. Fallback: live MFP
         client = await get_mfp_client_async()
         measurements = client.get_measurements(params.measurement, start, end)
-        return format_response({"values": ordered_dict_to_dict(measurements), "source": "live"}, params.response_format, f"{params.measurement} History")
-    except Exception as e: return f"Error getting measurements: {str(e)}"
+        return format_response(
+            {"measurement": params.measurement, "values": ordered_dict_to_dict(measurements), "source": "live"},
+            params.response_format,
+            f"{params.measurement} History",
+        )
+    except Exception as e:
+        return f"Error getting measurements: {str(e)}"
 
-@mcp.tool(name="mfp_set_measurement")
-async def mfp_set_measurement(params: SetMeasurementInput) -> str:
-    """Log a new body measurement for today."""
-    try:
-        client = await get_mfp_client_async()
-        client.set_measurements(params.measurement, params.value)
-        # Update local cache immediately
-        get_cache().upsert_measurement(date.today(), params.measurement, params.value)
-        return f"Successfully logged {params.measurement}: {params.value}"
-    except Exception as e: return f"Error setting measurement: {str(e)}"
 
-@mcp.tool(name="mfp_add_food_to_diary")
-async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
-    """Add a food item to the food diary."""
-    try:
-        client = await get_mfp_client_async()
-        target_date = parse_date(params.date)
-        add_food_to_diary(client=client, mfp_id=params.mfp_id, meal=params.meal, target_date=target_date, quantity=params.quantity, unit=params.unit)
-        # Invalidate cache so next sync picks up the change
-        get_cache().mark_synced(target_date, status="stale")
-        return f"Successfully added {params.mfp_id} to {params.meal}"
-    except Exception as e: return f"Error adding food to diary: {str(e)}"
-
-@mcp.tool(name="mfp_set_water")
-async def mfp_set_water(params: SetWaterInput) -> str:
-    """Log water intake for a specific date."""
-    try:
-        client = await get_mfp_client_async()
-        target_date = parse_date(params.date)
-        set_water_intake(client=client, target_date=target_date, cups=params.cups)
-        # Invalidate cache so next sync picks up the change
-        get_cache().mark_synced(target_date, status="stale")
-        return f"Successfully logged {params.cups} cups of water"
-    except Exception as e: return f"Error setting water intake: {str(e)}"
 
 if __name__ == "__main__":
     transport = os.environ.get("MFP_TRANSPORT", "streamable-http")

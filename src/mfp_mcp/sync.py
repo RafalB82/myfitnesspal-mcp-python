@@ -9,6 +9,12 @@ Usage:
 
 Called from cron 2-3x/day.  Uses the same authentication path as the
 MCP server (Camoufox persistent context -> cookies.json fallback).
+
+Sync flow:
+  1. Auth once via cookies or Camoufox
+  2. Determine which dates in range need syncing (not in cache, stale, or --force)
+  3. Fetch each date from MFP API
+  4. Save to SQLite: diary entries, daily totals, goals, water, notes
 """
 
 from __future__ import annotations
@@ -32,9 +38,6 @@ if str(_HERE) not in sys.path:
 
 from mfp_mcp.cache import MFPCache, date_range
 
-# Lazy import for Camoufox fallback — avoids circular import with server.py
-_HAVE_CAMOUFOX = None
-
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -47,6 +50,9 @@ logger = logging.getLogger("mfp_sync")
 CONFIG_DIR = Path.home() / ".mfp_mcp"
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 CACHE_DIR = CONFIG_DIR
+
+# ml per cup (US customary)
+_ML_PER_CUP = 237.0
 
 
 def _load_cookiejar(path: Path) -> CookieJar | None:
@@ -110,7 +116,7 @@ def _get_client(cookies_path: Path):
     _username = os.environ.get("MFP_USERNAME")
     _password = os.environ.get("MFP_PASSWORD")
 
-    # Lazy import to avoid circular dep (server imports cache, sync imports from server)
+    # Lazy import to avoid circular dep
     import importlib
     server_mod = importlib.import_module("mfp_mcp.server")
     auth_fn = getattr(server_mod, "authenticate_with_camoufox_async")
@@ -129,29 +135,66 @@ def _get_client(cookies_path: Path):
     raise RuntimeError("Could not authenticate — no cookies, no Camoufox.")
 
 
+_NUTRITION_FIELDS = ("calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium")
+
+
+def _float_or_none(value) -> float | None:
+    """Convert a pint Quantity or plain number to float, or None."""
+    if value is None:
+        return None
+    if hasattr(value, "magnitude"):
+        return round(float(value.magnitude), 1)
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return None
+
+
 def _meal_to_dict(meal) -> dict:
     """Serialize a myfitnesspal Meal object into a plain dict."""
     entries = []
     for e in meal.entries:
-        entry = {"mfp_id": e.mfp_id, "name": e.name}
-        # Optional fields
-        for attr in ("brand", "calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium"):
+        entry = {
+            "name": e.name,
+            "brand": getattr(e, "brand", None),
+        }
+        # Quantity / unit
+        entry["quantity"] = getattr(e, "quantity", None)
+        entry["unit"] = str(e.unit) if getattr(e, "unit", None) else None
+
+        # Nutrition fields
+        for attr in _NUTRITION_FIELDS:
             v = getattr(e, attr, None)
-            if v is not None:
-                entry[attr] = float(v.magnitude) if hasattr(v, "magnitude") else float(v)
+            entry[attr] = _float_or_none(v)
+
         entries.append(entry)
     return {"name": meal.name, "entries": entries}
 
 
-def _totals_dict(meal_or_day, keys=("calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium")) -> dict:
+def _totals_dict(meal_or_day) -> dict:
     """Extract macronutrient totals as a plain float dict."""
     result = {}
-    for k in keys:
-        v = getattr(meal_or_day, "totals", {}).get(k, 0)
-        if hasattr(v, "magnitude"):
-            v = float(v.magnitude)
-        if v:
-            result[k] = round(float(v), 1)
+    totals = getattr(meal_or_day, "totals", {})
+    for k in _NUTRITION_FIELDS:
+        v = totals.get(k, 0)
+        fv = _float_or_none(v)
+        if fv:
+            result[k] = fv
+    return result
+
+
+def _goals_dict(day) -> dict:
+    """Extract nutrition goals from a day object."""
+    goals = getattr(day, "goals", {})
+    if not goals:
+        return {}
+    result = {}
+    for k in _NUTRITION_FIELDS:
+        v = goals.get(k)
+        if v is not None:
+            fv = _float_or_none(v)
+            if fv is not None:
+                result[k] = fv
     return result
 
 
@@ -160,14 +203,17 @@ def sync_days(
     cache: MFPCache,
     days_to_sync: list[date],
     force: bool = False,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
     Sync a list of dates into the cache.
 
-    Returns (synced_count, skipped_count).
+    Returns (synced_count, skipped_count, failed_count).
+    Skips dates that are already 'complete' in sync_meta (unless force=True).
+    Re-syncs dates with status 'stale' or 'missing'.
     """
     synced = 0
     skipped = 0
+    failed = 0
 
     for d in days_to_sync:
         if not force and cache.is_synced(d):
@@ -179,44 +225,59 @@ def sync_days(
         except Exception as e:
             logger.warning("  %s — fetch failed: %s", d, e)
             cache.mark_synced(d, status="missing")
-            skipped += 1
+            failed += 1
             continue
 
-        # Serialize meals
+        # Serialize meals with full nutrition data
         meals_data = [_meal_to_dict(m) for m in day.meals if m.entries]
 
         # Daily totals (from sum of all meals)
-        daily_totals = {}
+        daily_totals: dict = {}
         for m in day.meals:
-            daily_totals.update(_totals_dict(m))
+            for k, v in _totals_dict(m).items():
+                daily_totals[k] = round(daily_totals.get(k, 0) + v, 1)
 
-        # Water (lazy-loaded)
-        water_ml = None
+        # Water: convert ml → cups
+        water_cups = None
         try:
             w = day.water
-            water_ml = float(w.ml) if hasattr(w, "ml") else float(w)
+            ml = float(w.ml) if hasattr(w, "ml") else float(w)
+            if ml and ml > 0:
+                water_cups = round(ml / _ML_PER_CUP, 1)
         except Exception:
             pass
 
-        cache.upsert_diary_day(d, meals_data, daily_totals, water_ml=water_ml)
+        # Notes
+        notes = getattr(day, "notes", None) or ""
+
+        # Goals
+        goals = _goals_dict(day)
+
+        cache.upsert_diary_day(
+            d,
+            meals_data,
+            daily_totals,
+            water_cups=water_cups,
+            notes=notes,
+            goals=goals if goals else None,
+        )
         cache.mark_synced(d)
         synced += 1
-        logger.info("  %s — synced (%d meals)", d, len(meals_data))
+        entry_count = sum(len(m.get("entries", [])) for m in meals_data)
+        logger.info("  %s — synced (%d entries, %d meals)", d, entry_count, len(meals_data))
 
-    return synced, skipped
+    return synced, skipped, failed
 
 
 def days_with_activity(client, start: date, end: date) -> list[date]:
     """
-    Determine which dates in [start, end] have diary data, using the
-    MFP measurements overview page as a quick index of active days.
-    Falls back to brute-force iteration.
+    Determine which dates in [start, end] have diary data by iterating
+    and checking for meals.
     """
     result = []
     for d in date_range(start, end):
         try:
             day = client.get_date(d)
-            # If meals exist, consider it active
             if any(m.entries for m in day.meals):
                 result.append(d)
         except Exception:
@@ -233,7 +294,7 @@ def main():
         default="today",
         help="End date (YYYY-MM-DD or 'today'). Default: today",
     )
-    parser.add_argument("--force", action="store_true", help="Re-sync already synced days")
+    parser.add_argument("--force", action="store_true", help="Re-sync all days regardless of status")
     parser.add_argument("--cache-dir", type=str, default=None, help="Cache directory (default: ~/.mfp_mcp)")
     args = parser.parse_args()
 
@@ -253,7 +314,7 @@ def main():
         start, end, (end - start).days + 1, args.force,
     )
 
-    # Auth
+    # Auth (one session for all days)
     t0 = time.time()
     try:
         client = _get_client(cookies_path)
@@ -265,21 +326,32 @@ def main():
     # Cache
     cache = MFPCache(cache_dir)
 
-    # Sync
-    t1 = time.time()
-
+    # Determine which days to sync
     if args.force:
         days = list(date_range(start, end))
     else:
-        days = days_with_activity(client, start, end)
+        # Check each day: sync if never synced OR status is not 'complete'
+        days = []
+        for d in date_range(start, end):
+            if cache.needs_resync(d):
+                days.append(d)
+        if not days:
+            # If all are already complete, check for days with activity
+            # that might have been missed (e.g. new dates not in sync_meta)
+            logger.info("All %d days already synced; checking for new activity...", (end - start).days + 1)
+            days = days_with_activity(client, start, end)
+            # Filter out already-complete ones
+            days = [d for d in days if cache.needs_resync(d)]
 
     if not days:
-        logger.info("No active days found in range %s → %s", start, end)
+        logger.info("No days to sync in range %s → %s", start, end)
     else:
-        synced, skipped = sync_days(client, cache, days, force=args.force)
+        logger.info("Syncing %d days...", len(days))
+        synced, skipped, failed = sync_days(client, cache, days, force=args.force)
+        elapsed = time.time() - t0
         logger.info(
-            "Sync done — %d synced, %d skipped, %.1fs",
-            synced, skipped, time.time() - t1,
+            "Sync done — %d synced, %d skipped, %d failed in %.1fs (%.1fs/day)",
+            synced, skipped, failed, elapsed, elapsed / max(synced, 1),
         )
 
     logger.info("Total time: %.1fs", time.time() - t0)
