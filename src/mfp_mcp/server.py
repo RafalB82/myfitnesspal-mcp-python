@@ -426,14 +426,15 @@ def _build_diary_from_cache(target_date: date, daily: Dict, entries: List[Dict],
         }
         meals[meal_name]["entries"].append(entry)
 
-        # Accumulate per-meal totals
-        for k in ("calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium"):
-            v = e.get(k) or 0
-            meal_totals[meal_name][k] = meal_totals[meal_name].get(k, 0) + v
+        # Accumulate per-meal totals from cache columns (carbs, not carbohydrates)
+        CACHE_NUTRITION_KEYS = ["calories", "protein", "carbs", "fat", "fiber", "sugar", "sodium"]
+        MFP_OUTPUT_KEYS = ["calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium"]
+        for cache_k, mfp_k in zip(CACHE_NUTRITION_KEYS, MFP_OUTPUT_KEYS):
+            v = e.get(cache_k) or 0
+            meal_totals[meal_name][mfp_k] = meal_totals[meal_name].get(mfp_k, 0) + v
 
-    # Normalize keys to match live MFP format
-    totals_keys = ["calories", "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium"]
-    daily_totals = {k: daily.get(k, 0) or 0 for k in totals_keys}
+    # Normalize keys to match live MFP format (cache uses carbs, output uses carbohydrates)
+    daily_totals = {mfp_k: daily.get(cache_k, 0) or 0 for cache_k, mfp_k in zip(CACHE_NUTRITION_KEYS, MFP_OUTPUT_KEYS)}
 
     for meal_name in meals:
         meals[meal_name]["totals"] = meal_totals.get(meal_name, {})

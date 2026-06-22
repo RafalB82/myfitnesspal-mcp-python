@@ -162,9 +162,11 @@ def _meal_to_dict(meal) -> dict:
         entry["quantity"] = getattr(e, "quantity", None)
         entry["unit"] = str(e.unit) if getattr(e, "unit", None) else None
 
-        # Nutrition fields
+        # Nutrition fields — take from e.totals dict (myfitnesspal lib doesn't expose
+        # calories/protein/etc as direct attributes, only inside the totals dict)
+        totals = getattr(e, "totals", {})
         for attr in _NUTRITION_FIELDS:
-            v = getattr(e, attr, None)
+            v = totals.get(attr)
             entry[attr] = _float_or_none(v)
 
         entries.append(entry)
